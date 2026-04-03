@@ -699,15 +699,23 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             name for name in marker_selected_factory_names if name not in hook_factories
         )
         if missing_factory_names:
-            msg = (
-                f"Unknown factory name(s) {missing_factory_names}."
-                f" Available names: {', '.join(hook_factories)}."
+            metafunc.fixturenames.append(_missing_asyncio_loop_factory.__name__)
+            metafunc.parametrize(
+                _missing_asyncio_loop_factory.__name__,
+                [
+                    f"Uknown factory name {name}."
+                    f" Available names: {', '.join(hook_factories)}."
+                    for name in missing_factory_names
+                ],
+                ids=missing_factory_names,
+                indirect=True,
             )
-            raise pytest.UsageError(msg)
         # Build the mapping in marker order to preserve explicit user
         # selection order in parametrization.
         effective_factories = {
-            name: hook_factories[name] for name in marker_selected_factory_names
+            name: hook_factories[name]
+            for name in marker_selected_factory_names
+            if name not in missing_factory_names
         }
     metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
     default_loop_scope = _get_default_test_loop_scope(metafunc.config)
@@ -969,6 +977,13 @@ for scope in Scope:
 @pytest.fixture(scope="session")
 def _asyncio_loop_factory(request: FixtureRequest) -> LoopFactory | None:
     return getattr(request, "param", None)
+
+
+@pytest.fixture(scope="session")
+def _missing_asyncio_loop_factory(request: FixtureRequest) -> None:
+    param = getattr(request, "param", None)
+    if param is not None:
+        raise pytest.skip(param)
 
 
 @pytest.fixture(scope="session", autouse=True)
