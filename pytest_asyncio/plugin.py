@@ -36,6 +36,7 @@ from typing import (
 )
 
 import pluggy
+
 import pytest
 from _pytest.fixtures import resolve_fixture_function
 from _pytest.scope import Scope
@@ -57,11 +58,6 @@ if sys.version_info >= (3, 11):
     from asyncio import Runner
 else:
     from backports.asyncio.runner import Runner
-
-if sys.version_info >= (3, 13):
-    from typing import TypeIs
-else:
-    from typing_extensions import TypeIs
 
 if TYPE_CHECKING:
     # AbstractEventLoopPolicy is deprecated and scheduled for removal in Python 3.16
@@ -503,175 +499,106 @@ def _apply_contextvar_changes(
     return restore_contextvars
 
 
-class PytestAsyncioFunction(Function):
-    """Base class for all test functions managed by pytest-asyncio."""
+class _AsyncTestKind(enum.Enum):
+    """The kind of async test pytest-asyncio manages an item as."""
 
-    @classmethod
-    def item_subclass_for(cls, item: Function, /) -> type[PytestAsyncioFunction] | None:
-        """
-        Returns a subclass of PytestAsyncioFunction if there is a specialized subclass
-        for the specified function item.
+    COROUTINE = enum.auto()
+    ASYNC_GENERATOR = enum.auto()
+    HYPOTHESIS = enum.auto()
+    HYPOTHESIS_UNSUPPORTED = enum.auto()
 
-        Return None if no specialized subclass exists for the specified item.
-        """
-        for subclass in cls.__subclasses__():
-            if subclass._can_substitute(item):
-                return subclass
+
+# Kinds that pytest-asyncio runs in an event loop.
+_RUNNABLE_ASYNC_KINDS = frozenset({_AsyncTestKind.COROUTINE, _AsyncTestKind.HYPOTHESIS})
+
+# Kinds that auto mode marks during collection. The unsupported-Hypothesis kind is
+# deliberately excluded, so it is only acted upon when a marker is applied explicitly.
+_COLLECTED_ASYNC_KINDS = frozenset(
+    {
+        _AsyncTestKind.COROUTINE,
+        _AsyncTestKind.ASYNC_GENERATOR,
+        _AsyncTestKind.HYPOTHESIS,
+    }
+)
+
+
+def _callable_kind(obj: object) -> _AsyncTestKind | None:
+    """
+    Classify a test callable as an async test kind, independent of any marker.
+
+    Returns None for callables pytest-asyncio does not manage, such as synchronous
+    functions. This function is pure and must not mutate anything.
+
+    The order of checks matters. A function decorated with ``@hypothesis.given`` is a
+    synchronous driver, so the coroutine to run lives at ``obj.hypothesis.inner_test``
+    and Hypothesis must be detected before the direct coroutine and async-generator
+    checks. ``staticmethod`` is unwrapped so that static async tests are detected.
+    """
+    if getattr(obj, "is_hypothesis_test", False):
+        inner = getattr(getattr(obj, "hypothesis", None), "inner_test", None)
+        if inner is None:
+            # Hypothesis is too old to expose ``hypothesis.inner_test``, so the
+            # coroutine cannot be wrapped. Recognized, but unsupported.
+            return _AsyncTestKind.HYPOTHESIS_UNSUPPORTED
+        if inspect.iscoroutinefunction(inner):
+            return _AsyncTestKind.HYPOTHESIS
+        # A synchronous Hypothesis test that happens to carry the marker.
         return None
-
-    @classmethod
-    def _from_function(cls, function: Function, /) -> Function:
-        """
-        Instantiates this specific PytestAsyncioFunction type from the specified
-        Function item.
-        """
-        assert function.get_closest_marker("asyncio")
-        assert function.parent is not None
-        subclass_instance = cls.from_parent(
-            function.parent,
-            name=function.name,
-            callspec=getattr(function, "callspec", None),
-            callobj=function.obj,
-            fixtureinfo=function._fixtureinfo,
-            keywords=function.keywords,
-            originalname=function.originalname,
-        )
-        subclass_instance.own_markers = function.own_markers
-        assert subclass_instance.own_markers == function.own_markers
-        return subclass_instance
-
-    @staticmethod
-    def _can_substitute(item: Function) -> bool:
-        """Returns whether the specified function can be replaced by this class"""
-        raise NotImplementedError()
-
-    def setup(self) -> None:
-        runner_fixture_id = f"_{self._loop_scope}_scoped_runner"
-        if runner_fixture_id not in self.fixturenames:
-            self.fixturenames.append(runner_fixture_id)
-        # When loop factories are configured, resolve the loop factory
-        # fixture early so that a factory variant change cascades cache
-        # invalidation before any async fixture checks its cache.
-        hook_caller = self.config.hook.pytest_asyncio_loop_factories
-        if hook_caller.get_hookimpls():
-            _ = self._request.getfixturevalue(_asyncio_loop_factory.__name__)
-        return super().setup()
-
-    def runtest(self) -> None:
-        runner_fixture_id = f"_{self._loop_scope}_scoped_runner"
-        runner = self._request.getfixturevalue(runner_fixture_id)
-        context = contextvars.copy_context()
-        synchronized_obj = _synchronize_coroutine(
-            getattr(*self._synchronization_target_attr), runner, context
-        )
-        with MonkeyPatch.context() as c:
-            c.setattr(*self._synchronization_target_attr, synchronized_obj)
-            super().runtest()
-
-    @functools.cached_property
-    def _loop_scope(self) -> _ScopeName:
-        """
-        Return the scope of the asyncio event loop this item is run in.
-
-        The effective scope is determined lazily. It is identical to to the
-        `loop_scope` value of the closest `asyncio` pytest marker. If no such
-        marker is present, the the loop scope is determined by the configuration
-        value of `asyncio_default_test_loop_scope`, instead.
-        """
-        marker = self.get_closest_marker("asyncio")
-        assert marker is not None
-        default_loop_scope = _get_default_test_loop_scope(self.config)
-        loop_scope = marker.kwargs.get("loop_scope") or marker.kwargs.get("scope")
-        if loop_scope is None:
-            return default_loop_scope
-        else:
-            return loop_scope
-
-    @property
-    def _synchronization_target_attr(self) -> tuple[object, str]:
-        """
-        Return the coroutine that needs to be synchronized during the test run.
-
-        This method is intended to be overwritten by subclasses when they need to apply
-        the coroutine synchronizer to a value that's different from self.obj
-        e.g. the AsyncHypothesisTest subclass.
-        """
-        return self, "obj"
+    func = obj.__func__ if isinstance(obj, staticmethod) else obj
+    if inspect.isasyncgenfunction(func):
+        return _AsyncTestKind.ASYNC_GENERATOR
+    if inspect.iscoroutinefunction(func):
+        return _AsyncTestKind.COROUTINE
+    return None
 
 
-class Coroutine(PytestAsyncioFunction):
-    """Pytest item created by a coroutine"""
-
-    @staticmethod
-    def _can_substitute(item: Function) -> bool:
-        func = item.obj
-        return inspect.iscoroutinefunction(func)
-
-
-class AsyncGenerator(PytestAsyncioFunction):
-    """Pytest item created by an asynchronous generator"""
-
-    @staticmethod
-    def _can_substitute(item: Function) -> bool:
-        func = item.obj
-        return inspect.isasyncgenfunction(func)
-
-    @classmethod
-    def _from_function(cls, function: Function, /) -> Function:
-        async_gen_item = super()._from_function(function)
-        unsupported_item_type_message = (
-            f"Tests based on asynchronous generators are not supported. "
-            f"{function.name} will be ignored."
-        )
-        async_gen_item.warn(PytestCollectionWarning(unsupported_item_type_message))
-        async_gen_item.add_marker(
-            pytest.mark.xfail(run=False, reason=unsupported_item_type_message)
-        )
-        return async_gen_item
-
-
-class AsyncStaticMethod(PytestAsyncioFunction):
+def _managed_kind(item: Item) -> _AsyncTestKind | None:
     """
-    Pytest item that is a coroutine or an asynchronous generator
-    decorated with staticmethod
+    Return the async test kind pytest-asyncio manages the item as, or None.
+
+    An item is managed when it carries the ``asyncio`` marker (whether applied as a
+    decorator, by auto mode, in a collection hook, or via a parameter set) and its
+    callable is an async test kind.
     """
-
-    @staticmethod
-    def _can_substitute(item: Function) -> bool:
-        func = item.obj
-        return isinstance(func, staticmethod) and _is_coroutine_or_asyncgen(
-            func.__func__
-        )
+    if not isinstance(item, Function):
+        return None
+    if item.get_closest_marker("asyncio") is None:
+        return None
+    return _callable_kind(item.obj)
 
 
-class AsyncHypothesisTest(PytestAsyncioFunction):
+def _synchronization_target(item: Function, kind: _AsyncTestKind) -> tuple[object, str]:
+    """Return the (holder, attribute) of the coroutine to synchronize."""
+    if kind is _AsyncTestKind.HYPOTHESIS:
+        return item.obj.hypothesis, "inner_test"
+    return item, "obj"
+
+
+def _item_loop_scope(item: Function) -> _ScopeName:
     """
-    Pytest item that is coroutine or an asynchronous generator decorated by
-    @hypothesis.given.
+    Return the scope of the asyncio event loop the item is run in.
+
+    It is identical to the ``loop_scope`` value of the closest ``asyncio`` marker. If
+    no such value is present, the loop scope is the ``asyncio_default_test_loop_scope``
+    configuration value.
     """
+    marker = item.get_closest_marker("asyncio")
+    assert marker is not None
+    loop_scope = marker.kwargs.get("loop_scope") or marker.kwargs.get("scope")
+    if loop_scope is None:
+        return _get_default_test_loop_scope(item.config)
+    return loop_scope
 
-    def setup(self) -> None:
-        if not getattr(self.obj, "hypothesis", False) and getattr(
-            self.obj, "is_hypothesis_test", False
-        ):
-            pytest.fail(
-                f"test function `{self!r}` is using Hypothesis, but pytest-asyncio "
-                "only works with Hypothesis 3.64.0 or later."
-            )
-        return super().setup()
 
-    @staticmethod
-    def _can_substitute(item: Function) -> bool:
-        func = item.obj
-        return (
-            getattr(func, "is_hypothesis_test", False)  # type: ignore[return-value]
-            and getattr(func, "hypothesis", None)
-            and inspect.iscoroutinefunction(func.hypothesis.inner_test)
-        )
+def _loop_factories_configured(item: Item) -> bool:
+    """Return whether any pytest_asyncio_loop_factories hook is implemented."""
+    return bool(item.ihook.pytest_asyncio_loop_factories.get_hookimpls())
 
-    @property
-    def _synchronization_target_attr(self) -> tuple[object, str]:
-        return self.obj.hypothesis, "inner_test"
+
+def _has_loop_factory_param(item: Function) -> bool:
+    """Return whether the item was parametrized with a loop factory."""
+    callspec = getattr(item, "callspec", None)
+    return callspec is not None and _asyncio_loop_factory.__name__ in callspec.params
 
 
 def _resolve_asyncio_marker(item: Function) -> Mark | None:
@@ -687,12 +614,16 @@ def _resolve_asyncio_marker(item: Function) -> Mark | None:
 # The function name needs to start with "pytest_"
 # see https://github.com/pytest-dev/pytest/issues/11307
 @pytest.hookimpl(specname="pytest_pycollect_makeitem", hookwrapper=True)
-def pytest_pycollect_makeitem_convert_async_functions_to_subclass(
+def pytest_pycollect_makeitem_apply_automode_marker(
     collector: pytest.Module | pytest.Class, name: str, obj: object
 ) -> Generator[None, pluggy.Result, None]:
     """
-    Converts coroutines and async generators collected as pytest.Functions
-    to AsyncFunction items.
+    In auto mode, apply the ``asyncio`` marker to collected async test items.
+
+    The marker is what makes pytest-asyncio manage an item. Applying it during
+    collection (rather than only classifying internally) keeps it observable to
+    downstream collection hooks and lets pytest_generate_tests parametrize loop
+    factories. Items are marked in place and never replaced.
     """
     hook_result = yield
     try:
@@ -705,30 +636,21 @@ def pytest_pycollect_makeitem_convert_async_functions_to_subclass(
     if not node_or_list_of_nodes:
         return
     if isinstance(node_or_list_of_nodes, Sequence):
-        node_iterator = iter(node_or_list_of_nodes)
+        nodes: Iterable[object] = node_or_list_of_nodes
     else:
-        # Treat single node as a single-element iterable
-        node_iterator = iter((node_or_list_of_nodes,))
-    updated_node_collection = []
-    for node in node_iterator:
-        updated_item = node
-        if isinstance(node, Function):
-            specialized_item_class = PytestAsyncioFunction.item_subclass_for(node)
-            if (
-                specialized_item_class is not None
-                and _resolve_asyncio_marker(node) is not None
-            ):
-                updated_item = specialized_item_class._from_function(node)
-        updated_node_collection.append(updated_item)
-    hook_result.force_result(updated_node_collection)
+        nodes = (node_or_list_of_nodes,)
+    for node in nodes:
+        if isinstance(node, Function) and _callable_kind(node.obj) in (
+            _COLLECTED_ASYNC_KINDS
+        ):
+            # Adds the marker in auto mode; a no-op in strict mode, where the
+            # user supplies the marker.
+            _resolve_asyncio_marker(node)
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    specialized_item_class = PytestAsyncioFunction.item_subclass_for(
-        metafunc.definition
-    )
-    if specialized_item_class is None:
+    if _callable_kind(metafunc.definition.obj) not in _COLLECTED_ASYNC_KINDS:
         return
 
     asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
@@ -844,38 +766,123 @@ def _set_event_loop(loop: AbstractEventLoop | None) -> None:
         asyncio.set_event_loop(loop)
 
 
+_MARKED_AFTER_PARAMETRIZATION_LOOP_FACTORIES_ERROR = """\
+The asyncio marker of {item} was not visible when loop-factory parametrization ran \
+(it was applied after collection, e.g. in a pytest_collection_modifyitems hook, or \
+only to a parametrize parameter set). Loop factories parametrize tests during \
+collection, which requires the marker to be visible when pytest_generate_tests runs. \
+Apply the marker during collection (e.g. in a pytest_pycollect_makeitem hook), run \
+pytest-asyncio in auto mode, or move the marker to the test function.\
+"""
+
+_ASYNC_GENERATOR_UNSUPPORTED = (
+    "Tests based on asynchronous generators are not supported. {name} will be ignored."
+)
+
+_HYPOTHESIS_UNSUPPORTED = (
+    "test function {item!r} is using Hypothesis, but pytest-asyncio only works with "
+    "Hypothesis 3.64.0 or later."
+)
+
+# Tracks the test functions for which the deprecated "scope" marker argument has
+# already been reported, so the warning is emitted once per test function rather than
+# once per parametrized item (see https://github.com/pytest-dev/pytest-asyncio/pull/798).
+_DEPRECATED_SCOPE_WARNED = pytest.StashKey[set[int]]()
+
+
+def _warn_deprecated_scope_once(item: Function, marker: Mark) -> None:
+    """Emit the deprecated ``scope`` marker-argument warning once per test function."""
+    if "scope" not in marker.kwargs:
+        return
+    warned = item.config.stash.setdefault(_DEPRECATED_SCOPE_WARNED, set())
+    if id(item.function) in warned:
+        return
+    warned.add(id(item.function))
+    warnings.warn(PytestDeprecationWarning(_MARKER_SCOPE_KWARG_DEPRECATION_WARNING))
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: Item) -> None:
+    """
+    Prepare a pytest-asyncio test before its fixtures are set up.
+
+    Runs ``tryfirst`` so that the scoped event-loop runner fixture is appended to
+    ``item.fixturenames`` before pytest core fills fixtures from it in
+    ``Function.setup``.
+    """
+    kind = _managed_kind(item)
+    if kind is None:
+        return
+    assert isinstance(item, Function)
+    if kind is _AsyncTestKind.HYPOTHESIS_UNSUPPORTED:
+        pytest.fail(_HYPOTHESIS_UNSUPPORTED.format(item=item.name), pytrace=False)
+    if kind is _AsyncTestKind.ASYNC_GENERATOR:
+        message = _ASYNC_GENERATOR_UNSUPPORTED.format(name=item.name)
+        item.warn(PytestCollectionWarning(message))
+        pytest.xfail(message)
+    # A coroutine or Hypothesis coroutine test: run it in a scoped event loop.
+    marker = item.get_closest_marker("asyncio")
+    assert marker is not None
+    _warn_deprecated_scope_once(item, marker)
+    _, selected_factory_names = _parse_asyncio_marker(marker)
+    # Loop factories are delivered through callspec parametrization in
+    # pytest_generate_tests, which only sees markers present on the test definition.
+    # A marker that requests factories but produced no factory parameter was not
+    # visible then (e.g. applied after collection or only to a parametrize parameter
+    # set), so it cannot be honored.
+    if (
+        selected_factory_names is not None or _loop_factories_configured(item)
+    ) and not _has_loop_factory_param(item):
+        pytest.fail(
+            _MARKED_AFTER_PARAMETRIZATION_LOOP_FACTORIES_ERROR.format(item=item.name),
+            pytrace=False,
+        )
+    runner_fixture_id = f"_{_item_loop_scope(item)}_scoped_runner"
+    if runner_fixture_id not in item.fixturenames:
+        item.fixturenames.append(runner_fixture_id)
+    if _loop_factories_configured(item):
+        # Resolve the loop factory (and thus the scoped runner) before the test's own
+        # fixtures, so a factory variant change cascades cache invalidation before any
+        # async fixture checks its cache. pytest core fills fixtures in fixturenames
+        # order once the request is active, so order the factory and runner first.
+        for fixture_id in (runner_fixture_id, _asyncio_loop_factory.__name__):
+            if fixture_id in item.fixturenames:
+                item.fixturenames.remove(fixture_id)
+            item.fixturenames.insert(0, fixture_id)
+
+
+def _warn_about_strict_mode_async_fixtures(pyfuncitem: Function) -> None:
+    """Warn when a strict-mode asyncio test requests a plain async @pytest.fixture."""
+    if _get_asyncio_mode(pyfuncitem.config) != Mode.STRICT:
+        return
+    for fixname, fixtures in pyfuncitem._fixtureinfo.name2fixturedefs.items():
+        # name2fixturedefs is a dict between fixture name and a list of matching
+        # fixturedefs. The last entry in the list is closest and the one used.
+        func = fixtures[-1].func
+        if _is_coroutine_or_asyncgen(func) and not _is_asyncio_fixture_function(func):
+            warnings.warn(
+                PytestDeprecationWarning(
+                    f"asyncio test {pyfuncitem.name!r} requested async "
+                    "@pytest.fixture "
+                    f"{fixname!r} in strict mode. "
+                    "You might want to use @pytest_asyncio.fixture or switch "
+                    "to auto mode. "
+                    "This will become an error in future versions of "
+                    "pytest-asyncio."
+                ),
+                stacklevel=1,
+            )
+            # no stacklevel points at the users code, so we set stacklevel=1
+            # so it at least indicates that it's the plugin complaining.
+            # Pytest gives the test file & name in the warnings summary at least
+
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
-    """Pytest hook called before a test case is run."""
-    if pyfuncitem.get_closest_marker("asyncio") is not None:
-        if is_async_test(pyfuncitem):
-            asyncio_mode = _get_asyncio_mode(pyfuncitem.config)
-            for fixname, fixtures in pyfuncitem._fixtureinfo.name2fixturedefs.items():
-                # name2fixturedefs is a dict between fixture name and a list of matching
-                # fixturedefs. The last entry in the list is closest and the one used.
-                func = fixtures[-1].func
-                if (
-                    asyncio_mode == Mode.STRICT
-                    and _is_coroutine_or_asyncgen(func)
-                    and not _is_asyncio_fixture_function(func)
-                ):
-                    warnings.warn(
-                        PytestDeprecationWarning(
-                            f"asyncio test {pyfuncitem.name!r} requested async "
-                            "@pytest.fixture "
-                            f"{fixname!r} in strict mode. "
-                            "You might want to use @pytest_asyncio.fixture or switch "
-                            "to auto mode. "
-                            "This will become an error in future versions of "
-                            "pytest-asyncio."
-                        ),
-                        stacklevel=1,
-                    )
-                    # no stacklevel points at the users code, so we set stacklevel=1
-                    # so it at least indicates that it's the plugin complaining.
-                    # Pytest gives the test file & name in the warnings summary at least
-
-        else:
+    """Synchronize the coroutine of a pytest-asyncio test before it is called."""
+    kind = _managed_kind(pyfuncitem)
+    if kind is None:
+        if pyfuncitem.get_closest_marker("asyncio") is not None:
             pyfuncitem.warn(
                 pytest.PytestWarning(
                     f"The test {pyfuncitem} is marked with '@pytest.mark.asyncio' "
@@ -885,7 +892,23 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
                     "check for global marks applied via 'pytestmark'."
                 )
             )
-    yield
+        yield
+        return None
+    if kind not in _RUNNABLE_ASYNC_KINDS:
+        # Async generators (and the unsupported-Hypothesis kind) are handled in
+        # pytest_runtest_setup and never reach the call phase.
+        yield
+        return None
+    _warn_about_strict_mode_async_fixtures(pyfuncitem)
+    runner = pyfuncitem._request.getfixturevalue(
+        f"_{_item_loop_scope(pyfuncitem)}_scoped_runner"
+    )
+    context = contextvars.copy_context()
+    target = _synchronization_target(pyfuncitem, kind)
+    synchronized_obj = _synchronize_coroutine(getattr(*target), runner, context)
+    with MonkeyPatch.context() as c:
+        c.setattr(*target, synchronized_obj)
+        yield
     return None
 
 
@@ -971,10 +994,11 @@ def _parse_asyncio_marker(
 ) -> tuple[_ScopeName | None, Sequence[str] | None]:
     assert asyncio_marker.name == "asyncio"
     _validate_asyncio_marker(asyncio_marker)
-    if "scope" in asyncio_marker.kwargs:
-        if "loop_scope" in asyncio_marker.kwargs:
-            raise pytest.UsageError(_DUPLICATE_LOOP_SCOPE_DEFINITION_ERROR)
-        warnings.warn(PytestDeprecationWarning(_MARKER_SCOPE_KWARG_DEPRECATION_WARNING))
+    # The deprecation warning for the "scope" argument is emitted once per test
+    # function by _warn_deprecated_scope_once, not here, because this function is
+    # called for every parametrized item.
+    if "scope" in asyncio_marker.kwargs and "loop_scope" in asyncio_marker.kwargs:
+        raise pytest.UsageError(_DUPLICATE_LOOP_SCOPE_DEFINITION_ERROR)
     scope = asyncio_marker.kwargs.get("loop_scope") or asyncio_marker.kwargs.get(
         "scope"
     )
@@ -1079,9 +1103,9 @@ def event_loop_policy() -> AbstractEventLoopPolicy:
     return _get_event_loop_policy()
 
 
-def is_async_test(item: Item) -> TypeIs[PytestAsyncioFunction]:
-    """Returns whether a test item is a pytest-asyncio test"""
-    return isinstance(item, PytestAsyncioFunction)
+def is_async_test(item: Item) -> bool:
+    """Returns whether a test item is managed by pytest-asyncio"""
+    return _managed_kind(item) is not None
 
 
 def _unused_port(socket_type: int) -> int:

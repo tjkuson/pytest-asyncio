@@ -1,0 +1,1 @@
+When the ``asyncio`` marker is applied only to a ``pytest.param`` parameter set, or otherwise after loop-factory parametrization has run, pytest-asyncio now reports a clear error instead of silently running the test on the default event loop. Loop factories are selected during collection, so the marker must be visible then.

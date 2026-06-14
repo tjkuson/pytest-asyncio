@@ -1,0 +1,1 @@
+The ``asyncio`` marker is now honored when it is applied after collection, for example in a ``pytest_collection_modifyitems`` hook. Such tests previously warned that they were not async functions and were not run.

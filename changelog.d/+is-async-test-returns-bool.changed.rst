@@ -1,0 +1,1 @@
+:func:`pytest_asyncio.is_async_test` now returns ``bool`` and recognizes async tests whose marker was applied after collection. Its return type previously narrowed to the now-removed ``PytestAsyncioFunction`` type.

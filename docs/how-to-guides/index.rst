@@ -18,6 +18,7 @@ How-To Guides
   run_package_tests_in_same_loop
   multiple_loops
   parametrize_with_asyncio
+  mark_tests_programmatically
   uvloop
   test_item_is_async
 

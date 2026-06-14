@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-import pytest
 from hypothesis import given, strategies as st
+
+import pytest
 from pytest import Pytester
 
 
