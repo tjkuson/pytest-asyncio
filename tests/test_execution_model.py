@@ -71,6 +71,44 @@ def test_marker_on_parameter_set_with_loop_factories_errors(pytester: Pytester):
     )
 
 
+def test_makeitem_marker_composes_with_loop_factories(pytester: Pytester):
+    """
+    The documented pytest_pycollect_makeitem workaround composes with factories.
+
+    Marking during collection (rather than after it) keeps the marker visible to
+    pytest_generate_tests, so the test is parametrized across the configured loop
+    factories and runs on the factory's loop.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        import inspect
+        import pytest
+
+        class TaggedLoop(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"tagged": TaggedLoop}
+
+        def pytest_pycollect_makeitem(collector, name, obj):
+            func = getattr(obj, "__func__", obj)
+            if not collector.istestfunction(obj, name):
+                return
+            if inspect.iscoroutinefunction(func):
+                pytest.mark.asyncio(obj)
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        from conftest import TaggedLoop
+
+        async def test_uses_factory():
+            assert isinstance(asyncio.get_running_loop(), TaggedLoop)
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1)
+
+
 def test_sync_hypothesis_test_with_asyncio_marker_is_not_adopted(pytester: Pytester):
     """A synchronous Hypothesis test carrying the asyncio marker is not run async."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")

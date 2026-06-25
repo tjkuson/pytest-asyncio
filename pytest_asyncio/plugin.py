@@ -32,6 +32,7 @@ from typing import (
     ParamSpec,
     TypeAlias,
     TypeVar,
+    cast,
     overload,
 )
 
@@ -69,6 +70,9 @@ _R = TypeVar("_R", bound=Awaitable[Any] | AsyncIterator[Any])
 _P = ParamSpec("_P")
 FixtureFunction = Callable[_P, _R]
 LoopFactory: TypeAlias = Callable[[], AbstractEventLoop]
+_CollectResult: TypeAlias = (
+    "pytest.Item | pytest.Collector | list[pytest.Item | pytest.Collector] | None"
+)
 
 
 class PytestAsyncioError(Exception):
@@ -613,10 +617,10 @@ def _resolve_asyncio_marker(item: Function) -> Mark | None:
 
 # The function name needs to start with "pytest_"
 # see https://github.com/pytest-dev/pytest/issues/11307
-@pytest.hookimpl(specname="pytest_pycollect_makeitem", hookwrapper=True)
+@pytest.hookimpl(specname="pytest_pycollect_makeitem", wrapper=True)
 def pytest_pycollect_makeitem_apply_automode_marker(
     collector: pytest.Module | pytest.Class, name: str, obj: object
-) -> Generator[None, pluggy.Result, None]:
+) -> Generator[None, _CollectResult, _CollectResult]:
     """
     In auto mode, apply the ``asyncio`` marker to collected async test items.
 
@@ -625,27 +629,21 @@ def pytest_pycollect_makeitem_apply_automode_marker(
     downstream collection hooks and lets pytest_generate_tests parametrize loop
     factories. Items are marked in place and never replaced.
     """
-    hook_result = yield
-    try:
-        node_or_list_of_nodes: (
-            pytest.Item | pytest.Collector | list[pytest.Item | pytest.Collector] | None
-        ) = hook_result.get_result()
-    except BaseException as e:
-        hook_result.force_exception(e)
-        return
-    if not node_or_list_of_nodes:
-        return
-    if isinstance(node_or_list_of_nodes, Sequence):
-        nodes: Iterable[object] = node_or_list_of_nodes
-    else:
-        nodes = (node_or_list_of_nodes,)
-    for node in nodes:
-        if isinstance(node, Function) and _callable_kind(node.obj) in (
-            _COLLECTED_ASYNC_KINDS
-        ):
-            # Adds the marker in auto mode; a no-op in strict mode, where the
-            # user supplies the marker.
-            _resolve_asyncio_marker(node)
+    node_or_list_of_nodes = yield
+    if node_or_list_of_nodes:
+        if isinstance(node_or_list_of_nodes, Sequence):
+            nodes: Iterable[object] = node_or_list_of_nodes
+        else:
+            nodes = (node_or_list_of_nodes,)
+        for node in nodes:
+            if (
+                isinstance(node, Function)
+                and _callable_kind(node.obj) in _COLLECTED_ASYNC_KINDS
+            ):
+                # Adds the marker in auto mode; a no-op in strict mode, where the
+                # user supplies the marker.
+                _resolve_asyncio_marker(node)
+    return node_or_list_of_nodes
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -838,17 +836,17 @@ def pytest_runtest_setup(item: Item) -> None:
             pytrace=False,
         )
     runner_fixture_id = f"_{_item_loop_scope(item)}_scoped_runner"
-    if runner_fixture_id not in item.fixturenames:
-        item.fixturenames.append(runner_fixture_id)
     if _loop_factories_configured(item):
-        # Resolve the loop factory (and thus the scoped runner) before the test's own
-        # fixtures, so a factory variant change cascades cache invalidation before any
-        # async fixture checks its cache. pytest core fills fixtures in fixturenames
-        # order once the request is active, so order the factory and runner first.
-        for fixture_id in (runner_fixture_id, _asyncio_loop_factory.__name__):
-            if fixture_id in item.fixturenames:
-                item.fixturenames.remove(fixture_id)
-            item.fixturenames.insert(0, fixture_id)
+        # Set up the runner (and, transitively, the loop factory it depends on) before
+        # the test's own fixtures, so a factory variant change cascades cache
+        # invalidation before any async fixture reuses its cache. pytest core fills
+        # fixtures in fixturenames order once the request is active, so order the
+        # runner first.
+        if runner_fixture_id in item.fixturenames:
+            item.fixturenames.remove(runner_fixture_id)
+        item.fixturenames.insert(0, runner_fixture_id)
+    elif runner_fixture_id not in item.fixturenames:
+        item.fixturenames.append(runner_fixture_id)
 
 
 def _warn_about_strict_mode_async_fixtures(pyfuncitem: Function) -> None:
@@ -877,8 +875,8 @@ def _warn_about_strict_mode_async_fixtures(pyfuncitem: Function) -> None:
             # Pytest gives the test file & name in the warnings summary at least
 
 
-@pytest.hookimpl(tryfirst=True, hookwrapper=True)
-def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
+@pytest.hookimpl(tryfirst=True, wrapper=True)
+def pytest_pyfunc_call(pyfuncitem: Function) -> Generator[None, object, object]:
     """Synchronize the coroutine of a pytest-asyncio test before it is called."""
     kind = _managed_kind(pyfuncitem)
     if kind is None:
@@ -892,24 +890,23 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
                     "check for global marks applied via 'pytestmark'."
                 )
             )
-        yield
-        return None
+        return (yield)
     if kind not in _RUNNABLE_ASYNC_KINDS:
         # Async generators (and the unsupported-Hypothesis kind) are handled in
         # pytest_runtest_setup and never reach the call phase.
-        yield
-        return None
+        return (yield)
     _warn_about_strict_mode_async_fixtures(pyfuncitem)
-    runner = pyfuncitem._request.getfixturevalue(
-        f"_{_item_loop_scope(pyfuncitem)}_scoped_runner"
+    # pytest_runtest_setup added the scoped runner to the item's fixtures, so it has
+    # already been filled into funcargs by the time the test is called.
+    runner = cast(
+        Runner, pyfuncitem.funcargs[f"_{_item_loop_scope(pyfuncitem)}_scoped_runner"]
     )
     context = contextvars.copy_context()
     target = _synchronization_target(pyfuncitem, kind)
     synchronized_obj = _synchronize_coroutine(getattr(*target), runner, context)
     with MonkeyPatch.context() as c:
         c.setattr(*target, synchronized_obj)
-        yield
-    return None
+        return (yield)
 
 
 def _synchronize_coroutine(
