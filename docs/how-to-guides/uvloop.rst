@@ -30,8 +30,9 @@ For older versions of Python and uvloop, you can override the *event_loop_policy
 
 .. code-block:: python
 
-    import pytest
     import uvloop
+
+    import pytest
 
 
     @pytest.fixture(scope="session")

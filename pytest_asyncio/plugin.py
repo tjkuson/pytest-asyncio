@@ -37,6 +37,7 @@ from typing import (
 )
 
 import pluggy
+
 import pytest
 from _pytest.fixtures import resolve_fixture_function
 from _pytest.scope import Scope
@@ -720,24 +721,96 @@ def pytest_pycollect_makeitem_convert_async_functions_to_subclass(
                 and _resolve_asyncio_marker(node) is not None
             ):
                 updated_item = specialized_item_class._from_function(node)
+            else:
+                callspec = getattr(node, "callspec", None)
+                loop_factory_fixture_name = _asyncio_loop_factory.__name__
+                if (
+                    callspec is not None
+                    and loop_factory_fixture_name in callspec.params
+                ):
+                    # pytest prunes the loop factory from the fixture closure after
+                    # pytest_generate_tests because it isn't statically requested.
+                    # Resolve it before any asyncio fixture can return a stale cached
+                    # value from a previous factory parameter.
+                    if loop_factory_fixture_name in node.fixturenames:
+                        node.fixturenames.remove(loop_factory_fixture_name)
+                    node.fixturenames.insert(0, loop_factory_fixture_name)
         updated_node_collection.append(updated_item)
     hook_result.force_result(updated_node_collection)
 
 
+def _is_asyncio_managed_fixture(fixturedef: FixtureDef, asyncio_mode: Mode) -> bool:
+    """Returns whether the specified fixture is managed by pytest-asyncio."""
+    if _is_asyncio_fixture_function(fixturedef.func):
+        return True
+    return asyncio_mode == Mode.AUTO and _is_coroutine_or_asyncgen(fixturedef.func)
+
+
+def _resolve_fixture_loop_scope(fixturedef: FixtureDef, config: Config) -> _ScopeName:
+    """Returns the scope of the event loop the specified fixture runs in."""
+    default_loop_scope = config.getini("asyncio_default_fixture_loop_scope")
+    return (
+        getattr(fixturedef.func, "_loop_scope", None)
+        or default_loop_scope
+        or fixturedef.scope
+    )
+
+
+def _widest_asyncio_fixture_loop_scope(
+    metafunc: pytest.Metafunc,
+) -> _ScopeName | None:
+    """
+    Returns the widest loop scope of the asyncio fixtures used by the test.
+
+    Returns None if the test doesn't use any pytest-asyncio managed fixtures.
+    """
+    asyncio_mode = _get_asyncio_mode(metafunc.config)
+    widest_scope: Scope | None = None
+    for fixturedefs in metafunc.definition._fixtureinfo.name2fixturedefs.values():
+        if not fixturedefs:
+            continue
+        # The last fixturedef in the list is the closest and the one used.
+        fixturedef = fixturedefs[-1]
+        if not _is_asyncio_managed_fixture(fixturedef, asyncio_mode):
+            continue
+        loop_scope = Scope(_resolve_fixture_loop_scope(fixturedef, metafunc.config))
+        if widest_scope is None or loop_scope > widest_scope:
+            widest_scope = loop_scope
+    if widest_scope is None:
+        return None
+    return widest_scope.value
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    loop_scope: _ScopeName
+    marker_selected_factory_names: Sequence[str] | None
     specialized_item_class = PytestAsyncioFunction.item_subclass_for(
         metafunc.definition
     )
-    if specialized_item_class is None:
-        return
-
-    asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
-    if asyncio_marker is None:
-        return
-    marker_loop_scope, marker_selected_factory_names = _parse_asyncio_marker(
-        asyncio_marker
-    )
+    if specialized_item_class is not None:
+        asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
+        if asyncio_marker is None:
+            return
+        marker_loop_scope, marker_selected_factory_names = _parse_asyncio_marker(
+            asyncio_marker
+        )
+        loop_scope = marker_loop_scope or _get_default_test_loop_scope(metafunc.config)
+    else:
+        hook_caller = metafunc.definition.ihook.pytest_asyncio_loop_factories
+        if not hook_caller.get_hookimpls():
+            return
+        # Synchronous tests don't run in an event loop, but the asyncio
+        # fixtures they use do. Those tests take part in the loop factory
+        # parametrization, so that they request the loop factory fixture
+        # with the same parameter as asyncio tests. An unparametrized
+        # request would invalidate the fixture cache and tear down live
+        # asyncio fixtures (see #1501).
+        fixture_loop_scope = _widest_asyncio_fixture_loop_scope(metafunc)
+        if fixture_loop_scope is None:
+            return
+        loop_scope = fixture_loop_scope
+        marker_selected_factory_names = None
 
     hook_factories = _collect_hook_loop_factories(metafunc.config, metafunc.definition)
     if hook_factories is None:
@@ -774,11 +847,9 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             )
             for name in marker_selected_factory_names
         ]
-    metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
-    default_loop_scope = _get_default_test_loop_scope(metafunc.config)
-    loop_scope = marker_loop_scope or default_loop_scope
-    # pytest.HIDDEN_PARAM was added in pytest 8.4
-    hide_id = len(factory_ids) == 1 and hasattr(pytest, "HIDDEN_PARAM")
+    if _asyncio_loop_factory.__name__ not in metafunc.fixturenames:
+        metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
+    hide_id = len(factory_ids) == 1
     metafunc.parametrize(
         _asyncio_loop_factory.__name__,
         factory_params,
@@ -918,19 +989,11 @@ def pytest_fixture_setup(fixturedef: FixtureDef, request) -> object | None:
             PytestDeprecationWarning(_EVENT_LOOP_POLICY_FIXTURE_DEPRECATION_WARNING),
         )
     asyncio_mode = _get_asyncio_mode(request.config)
-    if not _is_asyncio_fixture_function(fixturedef.func):
-        if asyncio_mode == Mode.STRICT:
-            # Ignore async fixtures without explicit asyncio mark in strict mode
-            # This applies to pytest_trio fixtures, for example
-            return (yield)
-        if not _is_coroutine_or_asyncgen(fixturedef.func):
-            return (yield)
-    default_loop_scope = request.config.getini("asyncio_default_fixture_loop_scope")
-    loop_scope = (
-        getattr(fixturedef.func, "_loop_scope", None)
-        or default_loop_scope
-        or fixturedef.scope
-    )
+    if not _is_asyncio_managed_fixture(fixturedef, asyncio_mode):
+        # Ignore async fixtures without explicit asyncio mark in strict mode
+        # This applies to pytest_trio fixtures, for example
+        return (yield)
+    loop_scope = _resolve_fixture_loop_scope(fixturedef, request.config)
     runner_fixture_id = f"_{loop_scope}_scoped_runner"
     runner = request.getfixturevalue(runner_fixture_id)
     # Prevent the runner closing before the fixture's async teardown.
