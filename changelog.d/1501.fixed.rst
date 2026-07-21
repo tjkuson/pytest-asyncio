@@ -1,0 +1,1 @@
+Loop factories now apply to synchronous tests that consume async fixtures, and the named factory variant is part of fixture and loop identity.

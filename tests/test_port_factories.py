@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-from pytest import Pytester
-
 import pytest_asyncio.plugin
+from pytest import Pytester
 
 
 def test_unused_tcp_port_selects_unused_port(pytester: Pytester):

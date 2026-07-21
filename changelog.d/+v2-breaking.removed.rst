@@ -1,0 +1,1 @@
+Removed the ``event_loop_policy`` fixture, the ``PytestAsyncioFunction`` item subclasses, and the deprecated ``scope=`` alias of ``pytest.mark.asyncio``. Plain async ``@pytest.fixture`` fixtures are now errors in strict mode.

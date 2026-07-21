@@ -154,7 +154,9 @@ def test_named_hook_factories_apply_to_async_fixtures(pytester: Pytester) -> Non
     result.assert_outcomes(passed=1)
 
 
-def test_sync_tests_are_not_parametrized_by_hook_factories(pytester: Pytester) -> None:
+def test_sync_tests_without_async_fixtures_are_not_parametrized_by_hook_factories(
+    pytester: Pytester,
+) -> None:
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makeconftest(dedent("""\
         import asyncio
@@ -182,12 +184,94 @@ def test_sync_tests_are_not_parametrized_by_hook_factories(pytester: Pytester) -
 
         @pytest.mark.asyncio
         async def test_async(request):
-            assert "_asyncio_loop_factory" in request.fixturenames
             loop_name = type(asyncio.get_running_loop()).__name__
             assert loop_name in ("CustomEventLoopA", "CustomEventLoopB")
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=3)
+
+
+def test_hook_factories_apply_to_async_fixtures_used_by_sync_tests(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        class CustomLoopA(asyncio.SelectorEventLoop):
+            pass
+
+        class CustomLoopB(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"a": CustomLoopA, "b": CustomLoopB}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def loop_type():
+            return type(asyncio.get_running_loop()).__name__
+
+        def test_sync(loop_type):
+            assert loop_type in {"CustomLoopA", "CustomLoopB"}
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
+def test_async_fixture_cache_is_separated_by_factory_variant(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        import pytest_asyncio
+
+        class CustomLoopA(asyncio.SelectorEventLoop):
+            pass
+
+        class CustomLoopB(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"a": CustomLoopA, "b": CustomLoopB}
+
+        @pytest_asyncio.fixture(scope="session", loop_scope="session")
+        async def loop_type():
+            return type(asyncio.get_running_loop()).__name__
+        """))
+    pytester.makepyfile(dedent("""\
+        expected = {"a": "CustomLoopA", "b": "CustomLoopB"}
+
+        def test_sync(loop_type, request):
+            assert loop_type == expected[request.node.callspec.id]
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
+def test_factory_name_is_part_of_loop_identity(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"first": asyncio.new_event_loop, "second": asyncio.new_event_loop}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        seen = set()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_variants_have_distinct_loops():
+            loop = asyncio.get_running_loop()
+            assert loop not in seen
+            seen.add(loop)
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
 
 
 @pytest.mark.parametrize(
@@ -783,8 +867,8 @@ def test_sync_fixture_sees_its_own_loop_when_wider_scoped_loop_active(
         async def test_sync_fixture_and_test_see_same_loop(sync_fixture_captures_loop):
             assert sync_fixture_captures_loop == id(asyncio.get_running_loop())
         """))
-    result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=1)
+    result = pytester.runpytest("--asyncio-mode=strict", "-W", "default")
+    result.assert_outcomes(passed=1, warnings=1)
 
 
 @pytest.mark.parametrize(
@@ -840,8 +924,8 @@ def test_sync_generator_fixture_teardown_sees_own_loop(
         async def test_generator_fixture_sees_correct_loop(sync_generator_fixture):
             assert sync_generator_fixture == id(asyncio.get_running_loop())
         """))
-    result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=1)
+    result = pytester.runpytest("--asyncio-mode=strict", "-W", "default")
+    result.assert_outcomes(passed=1, warnings=1)
 
 
 @pytest.mark.parametrize("loop_scope", ("module", "package", "session"))

@@ -1,0 +1,1 @@
+pytest-asyncio now manages event loops and async fixtures through pytest hooks. Async tests remain normal pytest ``Function`` items, and ``is_async_test`` now returns ``bool`` based on runtime marker and callable classification.

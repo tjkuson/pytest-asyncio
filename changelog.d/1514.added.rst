@@ -1,0 +1,1 @@
+Added ``PytestAsyncioWarning`` for dependency edges that cross asyncio loop scopes, including edges passing through synchronous fixtures.

@@ -115,8 +115,11 @@ def test_asyncio_mark_respects_the_loop_policy(
                     return CustomEventLoopPolicy()
 
                 @pytest.mark.asyncio
-                async def test_uses_custom_event_loop_policy(self):
-                    assert isinstance(
+                async def test_uses_custom_event_loop_policy(
+                    self, event_loop_policy
+                ):
+                    assert isinstance(event_loop_policy, CustomEventLoopPolicy)
+                    assert not isinstance(
                         asyncio.get_event_loop_policy(),
                         CustomEventLoopPolicy,
                     )
@@ -133,7 +136,7 @@ def test_asyncio_mark_respects_the_loop_policy(
         pytest_args.extend(["-W", "default"])
     result = pytester.runpytest(*pytest_args)
     if sys.version_info >= (3, 14):
-        result.assert_outcomes(passed=2, warnings=4)
+        result.assert_outcomes(passed=2, warnings=3)
         result.stdout.fnmatch_lines("*DefaultEventLoopPolicy*")
     else:
         result.assert_outcomes(passed=2)
@@ -160,8 +163,10 @@ def test_asyncio_mark_respects_parametrized_loop_policies(
 
             @pytest.mark.asyncio(loop_scope="class")
             class TestWithDifferentLoopPolicies:
-                async def test_parametrized_loop(self, request):
-                    pass
+                async def test_parametrized_loop(self, event_loop_policy):
+                    assert isinstance(
+                        event_loop_policy, asyncio.DefaultEventLoopPolicy
+                    )
             """))
     pytest_args = ["--asyncio-mode=strict"]
     if sys.version_info >= (3, 14):

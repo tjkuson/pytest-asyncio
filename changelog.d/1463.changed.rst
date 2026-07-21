@@ -1,0 +1,1 @@
+An ``asyncio`` marker applied to an individual ``pytest.param`` set is now recognized at runtime. Factory selection still has to be visible during ``pytest_generate_tests``.

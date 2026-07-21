@@ -129,6 +129,8 @@ asyncio_default_fixture_loop_scope = "function"
 junit_family = "xunit2"
 filterwarnings = [
   "error",
+  # Existing cross-scope behavior is tested explicitly and now warns in v2.
+  "default::pytest_asyncio.PytestAsyncioWarning",
 ]
 
 [tool.coverage.run]

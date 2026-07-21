@@ -7,6 +7,7 @@ How-To Guides
 
   migrate_from_0_21
   migrate_from_0_23
+  migrate_to_v2
   change_fixture_loop
   change_default_fixture_loop
   change_default_test_loop

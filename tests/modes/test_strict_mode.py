@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-import pytest
 from pytest import Pytester, version_tuple as pytest_version
 
 
@@ -83,11 +82,7 @@ def test_strict_mode_ignores_unmarked_coroutine(pytester: Pytester):
     result.stdout.fnmatch_lines(["*async def functions are not natively supported*"])
 
 
-@pytest.mark.skipif(
-    pytest_version >= (9, 1, 0),
-    reason="pytest >=9.1 converts unhandled async fixtures to errors",
-)
-def test_strict_mode_ignores_unmarked_fixture(pytester: Pytester):
+def test_strict_mode_rejects_unmarked_fixture(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import pytest
@@ -100,25 +95,12 @@ def test_strict_mode_ignores_unmarked_fixture(pytester: Pytester):
         async def test_anything(any_fixture):
             pass
         """))
-    result = pytester.runpytest("--asyncio-mode=strict", "-W default", "--assert=plain")
-
-    if pytest_version >= (8, 4, 0):
-        result.assert_outcomes(failed=1, skipped=0, warnings=2)
-    else:
-        result.assert_outcomes(skipped=1, warnings=2)
-    result.stdout.fnmatch_lines(
-        [
-            "*async def functions are not natively supported*",
-            "*coroutine 'any_fixture' was never awaited*",
-        ],
-    )
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*Async fixture 'any_fixture'*strict mode*"])
 
 
-@pytest.mark.skipif(
-    pytest_version >= (9, 1, 0),
-    reason="pytest >=9.1 converts unhandled async fixtures to errors",
-)
-def test_strict_mode_marked_test_unmarked_fixture_warning(pytester: Pytester):
+def test_strict_mode_marked_test_unmarked_fixture_error(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import pytest
@@ -136,36 +118,14 @@ def test_strict_mode_marked_test_unmarked_fixture_warning(pytester: Pytester):
             except StopIteration:
                 pass
         """))
-    result = pytester.runpytest("--asyncio-mode=strict", "-W default", "--assert=plain")
-    if pytest_version >= (8, 4, 0):
-        result.assert_outcomes(passed=1, failed=0, skipped=0, warnings=2)
-    else:
-        result.assert_outcomes(passed=1, failed=0, skipped=0, warnings=1)
-    result.stdout.fnmatch_lines(
-        [
-            "*warnings summary*",
-            (
-                "test_strict_mode_marked_test_unmarked_fixture_warning.py::"
-                "test_anything"
-            ),
-            (
-                "*/pytest_asyncio/plugin.py:*: PytestDeprecationWarning: "
-                "asyncio test 'test_anything' requested async "
-                "@pytest.fixture 'any_fixture' in strict mode. "
-                "You might want to use @pytest_asyncio.fixture or switch to "
-                "auto mode. "
-                "This will become an error in future versions of pytest-asyncio."
-            ),
-        ],
-    )
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*Async fixture 'any_fixture'*strict mode*"])
 
 
-# autouse is not handled in any special way currently
-@pytest.mark.skipif(
-    pytest_version >= (9, 1, 0),
-    reason="pytest >=9.1 converts unhandled async fixtures to errors",
-)
-def test_strict_mode_marked_test_unmarked_autouse_fixture_warning(pytester: Pytester):
+def test_strict_mode_marked_test_unmarked_autouse_fixture_error(
+    pytester: Pytester,
+):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import pytest
@@ -183,25 +143,6 @@ def test_strict_mode_marked_test_unmarked_autouse_fixture_warning(pytester: Pyte
             except StopIteration:
                 pass
         """))
-    result = pytester.runpytest("--asyncio-mode=strict", "-W default", "--assert=plain")
-    if pytest_version >= (8, 4, 0):
-        result.assert_outcomes(passed=1, warnings=2)
-    else:
-        result.assert_outcomes(passed=1, warnings=1)
-    result.stdout.fnmatch_lines(
-        [
-            "*warnings summary*",
-            (
-                "test_strict_mode_marked_test_unmarked_autouse_fixture_warning.py::"
-                "test_anything"
-            ),
-            (
-                "*/pytest_asyncio/plugin.py:*: PytestDeprecationWarning: "
-                "*asyncio test 'test_anything' requested async "
-                "@pytest.fixture 'any_fixture' in strict mode. "
-                "You might want to use @pytest_asyncio.fixture or switch to "
-                "auto mode. "
-                "This will become an error in future versions of pytest-asyncio."
-            ),
-        ],
-    )
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*Async fixture 'any_fixture'*strict mode*"])

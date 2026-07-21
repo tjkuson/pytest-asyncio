@@ -7,7 +7,7 @@ Hooks
 
 This hook returns a mapping from factory name strings to event loop factory callables for the current test item.
 
-By default, each pytest-asyncio test is run once per configured factory. Tests managed by other async plugins are unaffected. Synchronous tests are not parametrized. The configured loop scope still determines how long each event loop instance is kept alive.
+By default, each pytest-asyncio test is run once per configured factory. Synchronous tests are also parametrized when they consume a pytest-asyncio-managed fixture, so that the fixture cache stays associated with the correct factory. Other synchronous tests and tests managed by other async plugins are unaffected. The configured loop scope determines how long each event loop instance is kept alive.
 
 Factories should be callables without required parameters and should return an ``asyncio.AbstractEventLoop`` instance. The effective hook result must be a non-empty mapping of non-empty string names to callables.
 

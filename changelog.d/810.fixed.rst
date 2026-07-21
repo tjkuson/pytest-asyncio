@@ -1,0 +1,1 @@
+The ``asyncio`` marker is now honored when a collection hook applies it after collection. If such a late marker requires loop-factory parametrization that has already been missed, pytest-asyncio reports a guided error.
