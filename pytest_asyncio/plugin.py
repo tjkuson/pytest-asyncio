@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import enum
 import functools
 import inspect
@@ -15,7 +16,6 @@ import warnings
 from asyncio import AbstractEventLoop
 from collections.abc import (
     Callable,
-    Collection,
     Coroutine,
     Generator,
     Iterable,
@@ -36,7 +36,6 @@ from typing import (
 import pluggy
 
 import pytest
-from _pytest.fixtures import resolve_fixture_function
 from _pytest.nodes import Node
 from _pytest.scope import Scope
 from pytest import (
@@ -49,6 +48,13 @@ from pytest import (
     Parser,
     PytestCollectionWarning,
     PytestPluginManager,
+)
+
+from ._pytest_compat import (
+    FixtureInfo,
+    get_fixture_info,
+    get_requesting_item,
+    replace_fixture_function,
 )
 
 if sys.version_info >= (3, 11):
@@ -67,15 +73,12 @@ _CollectResult: TypeAlias = (
 )
 
 
+@dataclasses.dataclass(frozen=True, eq=False, slots=True)
 class _LoopFactoryVariant:
     """A stable, named factory parameter whose identity is part of loop identity."""
 
-    def __init__(self, name: str, factory: LoopFactory) -> None:
-        self.name = name
-        self.factory = factory
-
-    def __call__(self) -> AbstractEventLoop:
-        return self.factory()
+    name: str | None
+    factory: LoopFactory | None
 
 
 class PytestAsyncioError(Exception):
@@ -197,8 +200,11 @@ def fixture(
     | Callable[[FixtureFunction[_P, _R]], FixtureFunction[_P, _R]]
 ):
     if fixture_function is not None:
-        _make_asyncio_fixture_function(fixture_function, loop_scope)
-        return pytest.fixture(fixture_function, **kwargs)
+        wrapped_fixture = _create_asyncio_fixture_wrapper(
+            fixture_function,
+            loop_scope,
+        )
+        return pytest.fixture(wrapped_fixture, **kwargs)
 
     else:
 
@@ -261,7 +267,8 @@ def _collect_hook_loop_factories(
     item: Item,
 ) -> dict[str, LoopFactory] | None:
     hook_caller = item.ihook.pytest_asyncio_loop_factories
-    if not hook_caller.get_hookimpls():
+    hookimpls = hook_caller.get_hookimpls()
+    if not hookimpls:
         return None
 
     result = hook_caller(config=config, item=item)
@@ -334,9 +341,9 @@ class _ManagedRunner:
                 )
 
 
-def _scope_root(item: Item, scope: _ScopeName) -> Node:
+def _scope_root(node: Node, scope: _ScopeName) -> Node:
     if scope == "function":
-        return item
+        return node
     node_type: type[Node]
     if scope == "class":
         node_type = pytest.Class
@@ -345,21 +352,13 @@ def _scope_root(item: Item, scope: _ScopeName) -> Node:
     elif scope == "package":
         node_type = pytest.Package
     else:
-        return item.session
-    root = item.getparent(node_type)
+        return node.session
+    root = node.getparent(node_type)
     if root is not None:
         return root
     # Match pytest fixture-scope fallbacks: a missing class is item-local, while
     # a missing package behaves like session scope.
-    return item if scope == "class" else item.session
-
-
-def _item_loop_factory(item: Item) -> _LoopFactoryVariant | None:
-    callspec = getattr(item, "callspec", None)
-    if callspec is None:
-        return None
-    variant = callspec.params.get(_LOOP_FACTORY_PARAM)
-    return variant if isinstance(variant, _LoopFactoryVariant) else None
+    return node if scope == "class" else node.session
 
 
 class _LoopManager:
@@ -369,30 +368,39 @@ class _LoopManager:
         self._debug = _get_asyncio_debug(config)
         self._active: dict[
             tuple[_ScopeName, Node],
-            tuple[_LoopFactoryVariant | None, _ManagedRunner],
+            tuple[_LoopFactoryVariant, _ManagedRunner],
         ] = {}
 
-    def get_runner(self, item: Item, scope: _ScopeName) -> _ManagedRunner:
-        root = _scope_root(item, scope)
+    def get_runner(
+        self,
+        node: Node,
+        scope: _ScopeName,
+        variant: _LoopFactoryVariant,
+    ) -> _ManagedRunner:
+        root = _scope_root(node, scope)
         key = (scope, root)
-        factory = _item_loop_factory(item)
         active = self._active.get(key)
         if active is not None:
             active_factory, runner = active
-            if active_factory is factory:
+            if active_factory is variant:
                 return runner
+            del self._active[key]
             runner.close()
-        runner = _ManagedRunner(debug=self._debug, factory=factory)
-        self._active[key] = (factory, runner)
+        runner = _ManagedRunner(debug=self._debug, factory=variant.factory)
+        self._active[key] = (variant, runner)
+        root.addfinalizer(functools.partial(self._close_runner, key, runner))
         return runner
 
-    def close_finished_scopes(self, nextitem: Item | None) -> None:
-        next_chain = set(nextitem.listchain()) if nextitem is not None else set()
-        for key, (_, runner) in reversed(tuple(self._active.items())):
-            _, root = key
-            if root not in next_chain:
-                runner.close()
-                del self._active[key]
+    def _close_runner(
+        self,
+        key: tuple[_ScopeName, Node],
+        runner: _ManagedRunner,
+    ) -> None:
+        active = self._active.get(key)
+        if active is None or active[1] is not runner:
+            return
+        del self._active[key]
+        runner.close()
 
     def close_all(self) -> None:
         for _, runner in reversed(tuple(self._active.values())):
@@ -449,19 +457,146 @@ def pytest_report_header(config: Config) -> list[str]:
     ]
 
 
-def _fixture_synchronizer(
-    fixturedef: FixtureDef, runner: _ManagedRunner, request: pytest.FixtureRequest
-) -> Callable:
-    """Returns a synchronous function evaluating the specified fixture."""
-    fixture_function = resolve_fixture_function(fixturedef, request)
-    if inspect.isasyncgenfunction(fixturedef.func):
-        return _wrap_asyncgen_fixture(fixture_function, runner, request)  # type: ignore[arg-type]
-    elif inspect.iscoroutinefunction(fixturedef.func):
-        return _wrap_async_fixture(fixture_function, runner, request)  # type: ignore[arg-type]
-    elif inspect.isgeneratorfunction(fixturedef.func):
-        return _wrap_syncgen_fixture(fixture_function, runner)  # type: ignore[arg-type]
+def _fixture_wrapper_signature(fixture_function: Callable) -> inspect.Signature:
+    """Add pytest-asyncio's two internal fixture dependencies."""
+    signature = inspect.signature(fixture_function)
+    parameters = list(signature.parameters.values())
+    parameter_names = signature.parameters
+    if _LOOP_FACTORY_PARAM in parameter_names:
+        raise pytest.UsageError(
+            f"{_LOOP_FACTORY_PARAM!r} is reserved for use by pytest-asyncio."
+        )
+    if "request" not in parameter_names:
+        request_parameter = inspect.Parameter(
+            "request",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+        )
+        var_keyword_index = next(
+            (
+                index
+                for index, parameter in enumerate(parameters)
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD
+            ),
+            len(parameters),
+        )
+        parameters.insert(var_keyword_index, request_parameter)
+    factory_parameter = inspect.Parameter(
+        _LOOP_FACTORY_PARAM,
+        kind=inspect.Parameter.KEYWORD_ONLY,
+    )
+    var_keyword_index = next(
+        (
+            index
+            for index, parameter in enumerate(parameters)
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD
+        ),
+        len(parameters),
+    )
+    parameters.insert(var_keyword_index, factory_parameter)
+    return signature.replace(parameters=parameters)
+
+
+def _fixture_runner(
+    loop_scope: _ScopeName | None,
+    fixture_accepts_request: bool,
+    kwargs: dict[str, Any],
+) -> tuple[_ManagedRunner, pytest.FixtureRequest]:
+    request = kwargs["request"]
+    variant = kwargs.pop(_LOOP_FACTORY_PARAM)
+    if not isinstance(request, pytest.FixtureRequest):
+        raise TypeError("pytest-asyncio received an invalid fixture request")
+    if not isinstance(variant, _LoopFactoryVariant):
+        raise TypeError("pytest-asyncio received an invalid loop-factory token")
+    if not fixture_accepts_request:
+        del kwargs["request"]
+    effective_loop_scope = loop_scope or request.config.getini(
+        "asyncio_default_fixture_loop_scope"
+    )
+    if Scope(request.scope) > Scope(effective_loop_scope):
+        pytest.fail(
+            f"ScopeMismatch: fixture {request.fixturename!r} has caching scope "
+            f"{request.scope!r}, but its event loop scope is "
+            f"{effective_loop_scope!r}. The event loop scope must be at least "
+            "as wide as the fixture scope.",
+            pytrace=False,
+        )
+    item = get_requesting_item(request)
+    runner = _get_loop_manager(request.config).get_runner(
+        item,
+        effective_loop_scope,
+        variant,
+    )
+    return runner, request
+
+
+def _create_asyncio_fixture_wrapper(
+    fixture_function: FixtureFunction[_P, _R],
+    loop_scope: _ScopeName | None,
+) -> FixtureFunction[_P, _R]:
+    """Create a synchronous pytest fixture with explicit internal dependencies."""
+    fixture_accepts_request = (
+        "request" in inspect.signature(fixture_function).parameters
+    )
+    wrapper: Callable[..., Any]
+    if inspect.isasyncgenfunction(fixture_function):
+
+        @functools.wraps(fixture_function)
+        def asyncgen_wrapper(*args: Any, **kwargs: Any) -> Any:
+            runner, request = _fixture_runner(
+                loop_scope,
+                fixture_accepts_request,
+                kwargs,
+            )
+            synchronized = _wrap_asyncgen_fixture(
+                fixture_function,
+                runner,
+                request,
+            )
+            return synchronized(*args, **kwargs)
+
+        wrapper = asyncgen_wrapper
+    elif inspect.iscoroutinefunction(fixture_function):
+
+        @functools.wraps(fixture_function)
+        def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            runner, request = _fixture_runner(
+                loop_scope,
+                fixture_accepts_request,
+                kwargs,
+            )
+            synchronized = _wrap_async_fixture(fixture_function, runner, request)
+            return synchronized(*args, **kwargs)
+
+        wrapper = async_wrapper
+    elif inspect.isgeneratorfunction(fixture_function):
+
+        @functools.wraps(fixture_function)
+        def syncgen_wrapper(*args: Any, **kwargs: Any) -> Generator[Any]:
+            runner, _ = _fixture_runner(
+                loop_scope,
+                fixture_accepts_request,
+                kwargs,
+            )
+            yield from _wrap_syncgen_fixture(fixture_function, runner)(*args, **kwargs)
+
+        wrapper = syncgen_wrapper
     else:
-        return _wrap_sync_fixture(fixture_function, runner)  # type: ignore[arg-type]
+
+        @functools.wraps(fixture_function)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            runner, _ = _fixture_runner(
+                loop_scope,
+                fixture_accepts_request,
+                kwargs,
+            )
+            return _wrap_sync_fixture(fixture_function, runner)(*args, **kwargs)
+
+        wrapper = sync_wrapper
+
+    wrapper_with_signature: Any = wrapper
+    wrapper_with_signature.__signature__ = _fixture_wrapper_signature(fixture_function)
+    _make_asyncio_fixture_function(wrapper, loop_scope)
+    return wrapper  # type: ignore[return-value]
 
 
 SyncGenFixtureParams = ParamSpec("SyncGenFixtureParams")
@@ -728,6 +863,16 @@ def _has_loop_factory_param(item: Function) -> bool:
     return callspec is not None and _LOOP_FACTORY_PARAM in callspec.params
 
 
+def _item_loop_factory(item: Function) -> _LoopFactoryVariant:
+    callspec = getattr(item, "callspec", None)
+    variant = callspec.params.get(_LOOP_FACTORY_PARAM) if callspec is not None else None
+    if variant is None:
+        variant = _loop_factory_variant(item.config, None, None)
+    if not isinstance(variant, _LoopFactoryVariant):
+        raise TypeError("pytest-asyncio received an invalid loop-factory token")
+    return variant
+
+
 def _resolve_asyncio_marker(item: Function) -> Mark | None:
     marker = item.get_closest_marker("asyncio")
     if marker is not None:
@@ -736,6 +881,56 @@ def _resolve_asyncio_marker(item: Function) -> Mark | None:
         item.add_marker("asyncio")
         return item.get_closest_marker("asyncio")
     return None
+
+
+def _adapt_auto_mode_fixtures(item: Function) -> None:
+    """
+    Convert plain async fixtures once, before pytest starts fixture setup.
+
+    Pytest does not expose a public API for replacing a fixture definition after
+    ``@pytest.fixture`` has created it. Keep this compatibility seam confined to
+    auto mode; fixtures declared with ``pytest_asyncio.fixture`` are wrapped before
+    pytest creates their FixtureDef.
+    """
+    fixtureinfo = get_fixture_info(item)
+    if fixtureinfo is None:
+        return
+    for fixturedefs in fixtureinfo.name2fixturedefs.values():
+        for fixturedef in fixturedefs:
+            fixture_function = fixturedef.func
+            if _is_asyncio_fixture_function(fixture_function):
+                continue
+            if not _is_coroutine_or_asyncgen(fixture_function):
+                continue
+            underlying_function = getattr(
+                fixture_function,
+                "__func__",
+                fixture_function,
+            )
+            loop_scope = getattr(underlying_function, "_loop_scope", None)
+            wrapper = _create_asyncio_fixture_wrapper(
+                underlying_function,
+                loop_scope,
+            )
+            bound_instance = getattr(fixture_function, "__self__", None)
+            adapted_function = (
+                wrapper.__get__(bound_instance)
+                if bound_instance is not None
+                else wrapper
+            )
+            argnames = list(fixturedef.argnames)
+            if "request" not in argnames:
+                argnames.append("request")
+            if _LOOP_FACTORY_PARAM in argnames:
+                raise pytest.UsageError(
+                    f"{_LOOP_FACTORY_PARAM!r} is reserved for use by pytest-asyncio."
+                )
+            argnames.append(_LOOP_FACTORY_PARAM)
+            replace_fixture_function(
+                fixturedef,
+                adapted_function,
+                tuple(argnames),
+            )
 
 
 # The function name needs to start with "pytest_"
@@ -759,12 +954,6 @@ def pytest_pycollect_makeitem_apply_automode_marker(
         else:
             nodes = (node_or_list_of_nodes,)
         for node in nodes:
-            if isinstance(node, Function):
-                callspec = getattr(node, "callspec", None)
-                if callspec is not None and _LOOP_FACTORY_PARAM in callspec.params:
-                    if _LOOP_FACTORY_PARAM in node.fixturenames:
-                        node.fixturenames.remove(_LOOP_FACTORY_PARAM)
-                    node.fixturenames.insert(0, _LOOP_FACTORY_PARAM)
             if (
                 isinstance(node, Function)
                 and _callable_kind(node.obj) in _COLLECTED_ASYNC_KINDS
@@ -772,6 +961,11 @@ def pytest_pycollect_makeitem_apply_automode_marker(
                 # Adds the marker in auto mode; a no-op in strict mode, where the
                 # user supplies the marker.
                 _resolve_asyncio_marker(node)
+            if (
+                isinstance(node, Function)
+                and _get_asyncio_mode(node.config) == Mode.AUTO
+            ):
+                _adapt_auto_mode_fixtures(node)
     return node_or_list_of_nodes
 
 
@@ -785,6 +979,19 @@ def _resolve_fixture_loop_scope(fixturedef: FixtureDef, config: Config) -> _Scop
     return getattr(fixturedef.func, "_loop_scope", None) or config.getini(
         "asyncio_default_fixture_loop_scope"
     )
+
+
+def _resolved_fixturedef(
+    fixtureinfo: FixtureInfo,
+    fixture_name: str,
+    override_depths: Mapping[str, int],
+) -> FixtureDef | None:
+    """Resolve a fixture name using pytest's override-chain semantics."""
+    fixturedefs = fixtureinfo.name2fixturedefs.get(fixture_name)
+    if not fixturedefs:
+        return None
+    index = len(fixturedefs) - override_depths.get(fixture_name, 0) - 1
+    return fixturedefs[index] if index >= 0 else None
 
 
 def _warn_scope_edge(
@@ -814,7 +1021,7 @@ def _warn_scope_edge(
 
 def _warn_about_static_loop_scope_jumps(item: Item) -> None:
     """Inspect the fixture graph, including dependencies hidden by sync fixtures."""
-    fixtureinfo = getattr(item, "_fixtureinfo", None)
+    fixtureinfo = get_fixture_info(item)
     if fixtureinfo is None:
         return
     mode = _get_asyncio_mode(item.config)
@@ -823,17 +1030,25 @@ def _warn_about_static_loop_scope_jumps(item: Item) -> None:
         assert isinstance(item, Function)
         initial_owner = (item, f"test {item.name!r}", _item_loop_scope(item))
 
-    seen: set[tuple[FixtureDef, object | None]] = set()
+    seen: set[tuple[FixtureDef, object | None, tuple[tuple[str, int], ...]]] = set()
 
     def visit(
         fixture_name: str,
         owner_info: tuple[object, str, _ScopeName] | None,
+        override_depths: Mapping[str, int],
     ) -> None:
-        fixturedefs = fixtureinfo.name2fixturedefs.get(fixture_name)
-        if not fixturedefs:
+        fixturedef = _resolved_fixturedef(
+            fixtureinfo,
+            fixture_name,
+            override_depths,
+        )
+        if fixturedef is None:
             return
-        fixturedef = fixturedefs[-1]
-        state = (fixturedef, None if owner_info is None else owner_info[0])
+        state = (
+            fixturedef,
+            None if owner_info is None else owner_info[0],
+            tuple(sorted(override_depths.items())),
+        )
         if state in seen:
             return
         seen.add(state)
@@ -847,72 +1062,66 @@ def _warn_about_static_loop_scope_jumps(item: Item) -> None:
                 f"fixture {fixturedef.argname!r}",
                 _resolve_fixture_loop_scope(fixturedef, item.config),
             )
+        child_override_depths = dict(override_depths)
+        child_override_depths[fixturedef.argname] = (
+            child_override_depths.get(fixturedef.argname, 0) + 1
+        )
         for dependency_name in fixturedef.argnames:
-            visit(dependency_name, next_owner)
+            visit(dependency_name, next_owner, child_override_depths)
 
     for fixture_name in fixtureinfo.initialnames:
-        visit(fixture_name, initial_owner)
+        visit(fixture_name, initial_owner, {})
 
 
-def _warn_about_dynamic_loop_scope_jump(
-    fixturedef: FixtureDef, request: pytest.FixtureRequest
-) -> None:
-    """Handle fixture dependencies introduced by request.getfixturevalue()."""
-    mode = _get_asyncio_mode(request.config)
-    if not _is_asyncio_managed_fixture(fixturedef, mode):
-        return
+def _uses_asyncio_fixture(metafunc: pytest.Metafunc) -> bool:
+    mode = _get_asyncio_mode(metafunc.config)
+    fixtureinfo = get_fixture_info(metafunc.definition)
+    assert fixtureinfo is not None
+    seen: set[tuple[FixtureDef, tuple[tuple[str, int], ...]]] = set()
 
-    parent = getattr(request, "_parent_request", None)
-    while parent is not None:
-        parent_fixturedef = getattr(parent, "_fixturedef", None)
-        if parent_fixturedef is not None and _is_asyncio_managed_fixture(
-            parent_fixturedef, mode
-        ):
-            _warn_scope_edge(
-                request.config,
-                parent_fixturedef,
-                f"fixture {parent_fixturedef.argname!r}",
-                _resolve_fixture_loop_scope(parent_fixturedef, request.config),
-                fixturedef,
-            )
-            return
-        parent = getattr(parent, "_parent_request", None)
-
-    item = request._pyfuncitem
-    if _managed_kind(item) is not None:
-        assert isinstance(item, Function)
-        _warn_scope_edge(
-            request.config,
-            item,
-            f"test {item.name!r}",
-            _item_loop_scope(item),
-            fixturedef,
+    def visit(fixture_name: str, override_depths: Mapping[str, int]) -> bool:
+        fixturedef = _resolved_fixturedef(fixtureinfo, fixture_name, override_depths)
+        if fixturedef is None:
+            return False
+        state = (fixturedef, tuple(sorted(override_depths.items())))
+        if state in seen:
+            return False
+        seen.add(state)
+        if _is_asyncio_managed_fixture(fixturedef, mode):
+            return True
+        child_override_depths = dict(override_depths)
+        child_override_depths[fixturedef.argname] = (
+            child_override_depths.get(fixturedef.argname, 0) + 1
+        )
+        return any(
+            visit(dependency_name, child_override_depths)
+            for dependency_name in fixturedef.argnames
         )
 
+    return any(visit(fixture_name, {}) for fixture_name in fixtureinfo.initialnames)
 
-def _widest_asyncio_fixture_loop_scope(
-    metafunc: pytest.Metafunc,
-) -> _ScopeName | None:
-    mode = _get_asyncio_mode(metafunc.config)
-    widest: Scope | None = None
-    for fixturedefs in metafunc.definition._fixtureinfo.name2fixturedefs.values():
-        if not fixturedefs:
-            continue
-        fixturedef = fixturedefs[-1]
-        if not _is_asyncio_managed_fixture(fixturedef, mode):
-            continue
-        scope = Scope(_resolve_fixture_loop_scope(fixturedef, metafunc.config))
-        if widest is None or scope > widest:
-            widest = scope
-    return None if widest is None else widest.value
+
+def _same_loop_factory(
+    first: LoopFactory | None,
+    second: LoopFactory | None,
+) -> bool:
+    if first is second:
+        return True
+    if inspect.ismethod(first) and inspect.ismethod(second):
+        # Attribute access creates a fresh bound-method object each time. Compare
+        # the stable parts without invoking arbitrary user-defined equality.
+        return first.__func__ is second.__func__ and first.__self__ is second.__self__
+    return False
 
 
 def _loop_factory_variant(
-    config: Config, name: str, factory: LoopFactory
+    config: Config,
+    name: str | None,
+    factory: LoopFactory | None,
 ) -> _LoopFactoryVariant:
     variants = config.stash[_LOOP_FACTORY_VARIANTS_KEY]
     for variant in variants:
-        if variant.name == name and variant.factory is factory:
+        if variant.name == name and _same_loop_factory(variant.factory, factory):
             return variant
     variant = _LoopFactoryVariant(name, factory)
     variants.append(variant)
@@ -921,78 +1130,76 @@ def _loop_factory_variant(
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    loop_scope: _ScopeName
     marker_selected_factory_names: Sequence[str] | None
-    fixture_loop_scope = _widest_asyncio_fixture_loop_scope(metafunc)
     if _callable_kind(metafunc.definition.obj) in _COLLECTED_ASYNC_KINDS:
         asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
         if asyncio_marker is None:
             return
-        marker_loop_scope, marker_selected_factory_names = _parse_asyncio_marker(
-            asyncio_marker
-        )
-        test_loop_scope = Scope(
-            marker_loop_scope or _get_default_test_loop_scope(metafunc.config)
-        )
-        if fixture_loop_scope is not None:
-            test_loop_scope = max(test_loop_scope, Scope(fixture_loop_scope))
-        loop_scope = test_loop_scope.value
+        _, marker_selected_factory_names = _parse_asyncio_marker(asyncio_marker)
     else:
-        if fixture_loop_scope is None or not _loop_factories_configured(
-            metafunc.definition
-        ):
+        if not _uses_asyncio_fixture(metafunc):
             return
-        loop_scope = fixture_loop_scope
         marker_selected_factory_names = None
 
-    hook_factories = _collect_hook_loop_factories(metafunc.config, metafunc.definition)
-    if hook_factories is None:
+    hook_result = _collect_hook_loop_factories(metafunc.config, metafunc.definition)
+    if hook_result is None:
         if marker_selected_factory_names is not None:
             raise pytest.UsageError(
                 "mark.asyncio 'loop_factories' requires at least one "
                 "pytest_asyncio_loop_factories hook implementation."
             )
-        return
-
-    factory_params: Collection[object]
-    factory_ids: Collection[str]
-    if marker_selected_factory_names is None:
-        factory_params = [
-            _loop_factory_variant(metafunc.config, name, factory)
-            for name, factory in hook_factories.items()
+        factory_params: list[object] = [
+            _loop_factory_variant(metafunc.config, None, None)
         ]
-        factory_ids = hook_factories.keys()
+        factory_ids: list[object] = [pytest.HIDDEN_PARAM]
     else:
-        # Iterate in marker order to preserve explicit user selection
-        # order.
-        factory_ids = marker_selected_factory_names
-        factory_params = [
-            (
-                _loop_factory_variant(metafunc.config, name, hook_factories[name])
-                if name in hook_factories
-                else pytest.param(
-                    None,
-                    marks=pytest.mark.skip(
-                        reason=(
-                            f"Loop factory {name!r} is not available."
-                            f" Available factories:"
-                            f" {', '.join(hook_factories)}."
+        hook_factories = hook_result
+        if marker_selected_factory_names is None:
+            factory_params = [
+                _loop_factory_variant(metafunc.config, name, factory)
+                for name, factory in hook_factories.items()
+            ]
+            factory_ids = list(hook_factories)
+        else:
+            # Iterate in marker order to preserve explicit user selection order.
+            factory_ids = list(marker_selected_factory_names)
+            factory_params = [
+                (
+                    _loop_factory_variant(
+                        metafunc.config,
+                        name,
+                        hook_factories[name],
+                    )
+                    if name in hook_factories
+                    else pytest.param(
+                        _LoopFactoryVariant(name, None),
+                        marks=pytest.mark.skip(
+                            reason=(
+                                f"Loop factory {name!r} is not available."
+                                f" Available factories:"
+                                f" {', '.join(hook_factories)}."
+                            ),
                         ),
-                    ),
+                    )
                 )
-            )
-            for name in marker_selected_factory_names
-        ]
+                for name in marker_selected_factory_names
+            ]
+
     if _LOOP_FACTORY_PARAM not in metafunc.fixturenames:
         metafunc.fixturenames.insert(0, _LOOP_FACTORY_PARAM)
-    # pytest.HIDDEN_PARAM was added in pytest 8.4
-    hide_id = len(factory_ids) == 1 and hasattr(pytest, "HIDDEN_PARAM")
+    if len(factory_ids) == 1:
+        factory_ids = [pytest.HIDDEN_PARAM]
+    # Async fixture wrappers formally depend on this parameter, which lets pytest
+    # invalidate their caches when the factory changes. Keep its scope wide enough
+    # for every possible fixture scope. Pytest may reuse a direct-parameter
+    # FixtureDef for this name across functions, so choosing the scope per item can
+    # otherwise cause a ScopeMismatch when differently scoped fixtures coexist.
     metafunc.parametrize(
         _LOOP_FACTORY_PARAM,
         factory_params,
-        ids=(pytest.HIDDEN_PARAM,) if hide_id else factory_ids,
+        ids=factory_ids,
         indirect=False,
-        scope=loop_scope,
+        scope="session",
     )
 
 
@@ -1096,7 +1303,9 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> Generator[None, object, object]:
         # pytest_runtest_setup and never reach the call phase.
         return (yield)
     runner = _get_loop_manager(pyfuncitem.config).get_runner(
-        pyfuncitem, _item_loop_scope(pyfuncitem)
+        pyfuncitem,
+        _item_loop_scope(pyfuncitem),
+        _item_loop_factory(pyfuncitem),
     )
     context = contextvars.copy_context()
     target = _synchronization_target(pyfuncitem, kind)
@@ -1124,57 +1333,25 @@ def _synchronize_coroutine(
     return inner
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_protocol(
-    item: Item, nextitem: Item | None
-) -> Generator[None, object, object]:
-    """Keep scoped loops alive until pytest has finished fixture teardown."""
-    try:
-        return (yield)
-    finally:
-        _get_loop_manager(item.config).close_finished_scopes(nextitem)
-
-
-@pytest.hookimpl(wrapper=True)
-def pytest_fixture_setup(fixturedef: FixtureDef, request) -> object | None:
-    if fixturedef.argname == _LOOP_FACTORY_PARAM:
-        return (yield)
+@pytest.hookimpl(tryfirst=True)
+def pytest_fixture_setup(fixturedef: FixtureDef, request) -> None:
+    """Reject async fixtures that were not converted during collection."""
     asyncio_mode = _get_asyncio_mode(request.config)
-    explicitly_owned = _is_asyncio_fixture_function(fixturedef.func)
     is_async = _is_coroutine_or_asyncgen(fixturedef.func)
-    if not explicitly_owned and not is_async:
-        return (yield)
-    if not explicitly_owned and asyncio_mode == Mode.STRICT:
+    if not is_async:
+        return None
+    if asyncio_mode == Mode.STRICT:
         pytest.fail(
             f"Async fixture {fixturedef.argname!r} is decorated with @pytest.fixture "
             "in strict mode. Use @pytest_asyncio.fixture or switch to auto mode.",
             pytrace=False,
         )
-    _warn_about_dynamic_loop_scope_jump(fixturedef, request)
-    default_loop_scope = request.config.getini("asyncio_default_fixture_loop_scope")
-    loop_scope = getattr(fixturedef.func, "_loop_scope", None) or default_loop_scope
-    assert loop_scope is not None
-    if Scope(fixturedef.scope) > Scope(loop_scope):
-        pytest.fail(
-            f"ScopeMismatch: fixture {fixturedef.argname!r} has caching scope "
-            f"{fixturedef.scope!r}, but its event loop scope is {loop_scope!r}. "
-            "The event loop scope must be at least as wide as the fixture scope.",
-            pytrace=False,
-        )
-    item = request._pyfuncitem
-    runner = _get_loop_manager(request.config).get_runner(item, loop_scope)
-    callspec = getattr(item, "callspec", None)
-    if callspec is not None and _LOOP_FACTORY_PARAM in callspec.params:
-        factory_fixturedef = request._get_active_fixturedef(_LOOP_FACTORY_PARAM)
-        factory_fixturedef.addfinalizer(
-            functools.partial(fixturedef.finish, request=request)
-        )
-    synchronizer = _fixture_synchronizer(fixturedef, runner, request)
-    _make_asyncio_fixture_function(synchronizer, loop_scope)
-    with MonkeyPatch.context() as c:
-        c.setattr(fixturedef, "func", synchronizer)
-        hook_result = yield
-    return hook_result
+    pytest.fail(
+        f"Async fixture {fixturedef.argname!r} was requested dynamically and could "
+        "not be prepared during collection. Declare it with "
+        "@pytest_asyncio.fixture.",
+        pytrace=False,
+    )
 
 
 _MARKER_SCOPE_KWARG_ERROR = """\

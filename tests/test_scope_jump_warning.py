@@ -101,3 +101,30 @@ def test_warning_type_is_public() -> None:
     from pytest_asyncio import PytestAsyncioWarning
 
     assert issubclass(PytestAsyncioWarning, Warning)
+
+
+def test_warning_follows_fixture_override_chain(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture(scope="session", loop_scope="session")
+        async def resource():
+            return object()
+        """))
+    pytester.makepyfile(dedent("""\
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def resource(resource):
+            return resource
+
+        @pytest.mark.asyncio
+        async def test_resource(resource):
+            pass
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict", "-W", "default")
+    result.assert_outcomes(passed=1, warnings=1)
+    result.stdout.fnmatch_lines(
+        ["*PytestAsyncioWarning: fixture 'resource' uses*function*resource*session*"]
+    )

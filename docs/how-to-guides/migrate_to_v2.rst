@@ -38,6 +38,11 @@ In strict mode, async fixtures declared with ``pytest.fixture`` are now an error
 Declare them with ``pytest_asyncio.fixture`` or opt into auto mode. Auto mode owns
 plain async tests and async fixtures.
 
+Auto mode prepares plain async fixtures that are visible in the test's static
+fixture graph during collection. If a fixture is only discovered later through
+``request.getfixturevalue()``, declare it with ``pytest_asyncio.fixture`` so its
+loop-factory dependency is known to pytest before fixture setup.
+
 Plugin compatibility
 ====================
 
@@ -59,6 +64,13 @@ Implementation differences from the prototype
 
 The playground prototype keyed runners only by the scope name and sketched a new
 fixture wrapper. The production implementation instead keys each runner by its
-actual pytest scope root and loop-factory variant, retains the public
-``pytest_asyncio.fixture`` decorator, supports package scope, and uses the
-standard ``asyncio.Runner`` execution model for each async phase.
+actual pytest scope root and loop-factory variant, registers runner cleanup on
+that pytest scope node, retains the public ``pytest_asyncio.fixture`` decorator,
+supports package scope, and uses the standard ``asyncio.Runner`` execution model
+for each async phase.
+
+Loop-factory identity is carried by a hidden direct parameter so pytest's normal
+fixture dependency and cache invalidation rules apply when the factory changes.
+The parameter is added only to managed async tests and synchronous tests that
+consume managed async fixtures; it is not an autouse fixture and does not affect
+unrelated test items. Event loops and runners themselves are not fixtures.

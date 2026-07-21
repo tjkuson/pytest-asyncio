@@ -5,7 +5,9 @@ Hooks
 ``pytest_asyncio_loop_factories``
 =================================
 
-This hook returns a mapping from factory name strings to event loop factory callables for the current test item.
+This hook receives the pytest ``config`` and current test ``item``, and returns
+a mapping from factory name strings to event loop factory callables for that
+test item.
 
 By default, each pytest-asyncio test is run once per configured factory. Synchronous tests are also parametrized when they consume a pytest-asyncio-managed fixture, so that the fixture cache stays associated with the correct factory. Other synchronous tests and tests managed by other async plugins are unaffected. The configured loop scope determines how long each event loop instance is kept alive.
 
@@ -13,4 +15,11 @@ Factories should be callables without required parameters and should return an `
 
 When multiple ``pytest_asyncio_loop_factories`` implementations are present, pytest-asyncio uses the first non-``None`` result in pytest's hook dispatch order.
 
-When the hook is defined, async tests are parametrized via ``pytest.metafunc.parametrize``, and mapping keys are used as test IDs. For example, a test ``test_example`` with an event loop factory key ``foo`` will appear as ``test_example[foo]`` in test output.
+The mapping may vary by test function. A factory name may therefore resolve to
+different callables for different tests; pytest-asyncio keeps those variants
+separate even when their display names match.
+
+When the hook is defined, async tests are parametrized using pytest's standard
+parametrization machinery, and mapping keys are used as test IDs. For example,
+a test ``test_example`` with an event loop factory key ``foo`` will appear as
+``test_example[foo]`` in test output.

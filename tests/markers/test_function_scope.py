@@ -77,7 +77,7 @@ def test_scope_argument_is_an_error(pytester: Pytester):
     result.stdout.fnmatch_lines("*scope*not supported*loop_scope*")
 
 
-def test_asyncio_mark_respects_the_loop_policy(
+def test_event_loop_policy_fixture_does_not_configure_loop(
     pytester: Pytester,
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
@@ -114,7 +114,7 @@ def test_asyncio_mark_respects_the_loop_policy(
         result.assert_outcomes(passed=1)
 
 
-def test_asyncio_mark_respects_parametrized_loop_policies(
+def test_parametrized_event_loop_policy_fixture_does_not_configure_loop(
     pytester: Pytester,
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")

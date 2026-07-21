@@ -6,6 +6,26 @@ import pytest
 from pytest import Pytester
 
 
+def test_hook_receives_config_and_item(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        def pytest_asyncio_loop_factories(config, item):
+            assert config is item.config
+            assert item.name == "test_example"
+            return {"asyncio": asyncio.new_event_loop}
+        """))
+    pytester.makepyfile(dedent("""\
+        import pytest
+
+        @pytest.mark.asyncio
+        async def test_example():
+            pass
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1)
+
+
 @pytest.mark.skipif(
     not hasattr(pytest, "HIDDEN_PARAM"),
     reason="pytest.HIDDEN_PARAM requires pytest 8.4+",
@@ -180,10 +200,15 @@ def test_sync_tests_without_async_fixtures_are_not_parametrized_by_hook_factorie
         pytest_plugins = "pytest_asyncio"
 
         def test_sync(request):
-            assert True
+            assert "_pytest_asyncio_loop_factory" not in request.fixturenames
+            callspec = getattr(request.node, "callspec", None)
+            assert callspec is None or (
+                "_pytest_asyncio_loop_factory" not in callspec.params
+            )
 
         @pytest.mark.asyncio
         async def test_async(request):
+            assert "_pytest_asyncio_loop_factory" in request.node.callspec.params
             loop_name = type(asyncio.get_running_loop()).__name__
             assert loop_name in ("CustomEventLoopA", "CustomEventLoopB")
         """))
@@ -707,6 +732,39 @@ def test_hook_factories_work_in_auto_mode(pytester: Pytester) -> None:
     result.assert_outcomes(passed=1)
 
 
+def test_auto_mode_fixture_cache_follows_loop_factory_parameter(
+    pytester: Pytester,
+) -> None:
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = session")
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        class CustomLoopA(asyncio.SelectorEventLoop):
+            pass
+
+        class CustomLoopB(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"loop_a": CustomLoopA, "loop_b": CustomLoopB}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.fixture(scope="session")
+        async def fixture_loop():
+            return asyncio.get_running_loop()
+
+        @pytest.mark.asyncio(loop_scope="session")
+        async def test_fixture_matches_running_loop(fixture_loop, request):
+            assert fixture_loop is asyncio.get_running_loop()
+            assert "_pytest_asyncio_loop_factory" in request.node.callspec.params
+        """))
+    result = pytester.runpytest("--asyncio-mode=auto")
+    result.assert_outcomes(passed=2)
+
+
 def test_no_event_loop_leak_with_custom_factory(pytester: Pytester) -> None:
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makeconftest(dedent("""\
@@ -1000,4 +1058,140 @@ def test_async_fixture_recreated_per_loop_factory_variant(
             assert fixture_loop_type == running_loop_type
         """))
     result = pytester.runpytest("--asyncio-mode=strict", "-v")
+    result.assert_outcomes(passed=2)
+
+
+def test_bound_method_factory_keeps_module_scoped_loop(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        class Factories:
+            def new_loop(self):
+                return asyncio.new_event_loop()
+
+        factories = Factories()
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"bound": factories.new_loop}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        remembered_loop = None
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first():
+            global remembered_loop
+            remembered_loop = asyncio.get_running_loop()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second():
+            assert asyncio.get_running_loop() is remembered_loop
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
+def test_factory_parameter_scope_preserves_module_loop_sharing(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        class CustomLoopA(asyncio.SelectorEventLoop):
+            pass
+
+        class CustomLoopB(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"loop_a": CustomLoopA, "loop_b": CustomLoopB}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        remembered_loops = {}
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first():
+            loop = asyncio.get_running_loop()
+            remembered_loops[type(loop)] = loop
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second():
+            loop = asyncio.get_running_loop()
+            assert loop is remembered_loops[type(loop)]
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=4)
+
+
+def test_factory_change_invalidates_wide_async_fixture_across_hook_locality(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture(scope="session", loop_scope="session")
+        async def resource_loop():
+            return asyncio.get_running_loop()
+        """))
+    pytester.makepyfile(test_without_factory=dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.mark.asyncio(loop_scope="session")
+        async def test_without_factory(resource_loop):
+            assert asyncio.get_running_loop() is resource_loop
+        """))
+    subdir = pytester.mkdir("with_factory")
+    subdir.joinpath("conftest.py").write_text(dedent("""\
+        import asyncio
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"subtree": asyncio.new_event_loop}
+        """))
+    subdir.joinpath("test_with_factory.py").write_text(dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.mark.asyncio(loop_scope="session")
+        async def test_with_factory(resource_loop):
+            assert asyncio.get_running_loop() is resource_loop
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
+def test_same_factory_name_can_resolve_per_test(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        class FirstLoop(asyncio.SelectorEventLoop):
+            pass
+
+        class SecondLoop(asyncio.SelectorEventLoop):
+            pass
+
+        def pytest_asyncio_loop_factories(config, item):
+            if item.name == "test_first":
+                return {"shared": FirstLoop}
+            return {"shared": SecondLoop}
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.mark.asyncio
+        async def test_first():
+            assert type(asyncio.get_running_loop()).__name__ == "FirstLoop"
+
+        @pytest.mark.asyncio
+        async def test_second():
+            assert type(asyncio.get_running_loop()).__name__ == "SecondLoop"
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=2)

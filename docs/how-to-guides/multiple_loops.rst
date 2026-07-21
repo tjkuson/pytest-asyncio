@@ -14,4 +14,6 @@ Return multiple named factories from ``pytest_asyncio_loop_factories``. The foll
 .. include:: multiple_loops/test_multiple_loops.py
     :code: python
 
-The hook receives the test item, so it can return different mappings for different parts of a test suite. A test can also select factory names with ``pytest.mark.asyncio(loop_factories=[...])``.
+The hook receives the pytest ``config`` and current test ``item``, so it can
+return different mappings for different parts of a test suite. A test can also
+select factory names with ``pytest.mark.asyncio(loop_factories=[...])``.

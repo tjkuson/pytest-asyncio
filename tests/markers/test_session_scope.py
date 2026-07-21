@@ -61,7 +61,7 @@ def test_asyncio_mark_provides_session_scoped_loop_strict_mode(pytester: Pyteste
     result.assert_outcomes(passed=4)
 
 
-def test_asyncio_mark_respects_the_loop_policy(
+def test_event_loop_policy_fixture_does_not_configure_loop(
     pytester: Pytester,
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
@@ -124,7 +124,7 @@ def test_asyncio_mark_respects_the_loop_policy(
         result.assert_outcomes(passed=2)
 
 
-def test_asyncio_mark_respects_parametrized_loop_policies(
+def test_parametrized_event_loop_policy_fixture_does_not_configure_loop(
     pytester: Pytester,
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")

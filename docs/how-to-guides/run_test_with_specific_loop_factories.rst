@@ -20,4 +20,4 @@ If a requested factory name is not available from the hook, the test variant for
 
 For declaring the factories themselves, see :doc:`custom_loop_factory`.
 
-For choosing the available factories from the pytest item, see :doc:`configure_loop_factories_per_test`.
+For choosing the available factories from the test item, see :doc:`configure_loop_factories_per_test`.
