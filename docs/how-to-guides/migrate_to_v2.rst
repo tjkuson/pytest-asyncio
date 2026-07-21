@@ -10,9 +10,9 @@ removed.
 Replace event loop policies with loop factories
 ================================================
 
-pytest-asyncio no longer defines or automatically requests an
-``event_loop_policy`` fixture. A fixture with that name is now an ordinary user
-fixture and has no effect on pytest-asyncio. Implement
+pytest-asyncio no longer defines or accepts an ``event_loop_policy`` fixture.
+Requesting a fixture with that name is an error, preventing an old policy
+override from becoming silently ineffective. Implement
 ``pytest_asyncio_loop_factories`` in ``conftest.py`` instead:
 
 .. code-block:: python
@@ -37,6 +37,10 @@ required.
 In strict mode, async fixtures declared with ``pytest.fixture`` are now an error.
 Declare them with ``pytest_asyncio.fixture`` or opt into auto mode. Auto mode owns
 plain async tests and async fixtures.
+
+Event loops are owned by pytest-asyncio until their configured loop scope ends.
+Closing one from test or fixture code is an error because it prevents the runner
+from completing async-generator and executor cleanup.
 
 Auto mode prepares plain async fixtures that are visible in the test's static
 fixture graph during collection. If a fixture is only discovered later through
@@ -69,8 +73,8 @@ that pytest scope node, retains the public ``pytest_asyncio.fixture`` decorator,
 supports package scope, and uses the standard ``asyncio.Runner`` execution model
 for each async phase.
 
-Loop-factory identity is carried by a hidden direct parameter so pytest's normal
-fixture dependency and cache invalidation rules apply when the factory changes.
-The parameter is added only to managed async tests and synchronous tests that
-consume managed async fixtures; it is not an autouse fixture and does not affect
-unrelated test items. Event loops and runners themselves are not fixtures.
+Loop-factory identity is carried by one non-autouse internal fixture so pytest's
+normal dependency and cache invalidation rules apply when the factory changes.
+The fixture is requested only by managed async fixtures and tests parametrized
+by the loop-factory hook. Without that hook, pytest-asyncio does not parametrize
+test items. Event loops and runners themselves are not fixtures.

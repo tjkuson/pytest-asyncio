@@ -75,6 +75,21 @@ def test_error_when_additional_keyword_arguments_are_passed(
     )
 
 
+def test_error_when_loop_scope_is_invalid(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(dedent("""\
+        import pytest
+
+        @pytest.mark.asyncio(loop_scope="invalid")
+        async def test_anything():
+            pass
+        """))
+    result = pytester.runpytest("--assert=plain")
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(
+        ["*'invalid' is not a valid asyncio marker loop scope*"]
+    )
+
+
 @pytest.mark.parametrize(
     "loop_factories_value",
     ('"custom"', "[]", '[""]', "[1]"),

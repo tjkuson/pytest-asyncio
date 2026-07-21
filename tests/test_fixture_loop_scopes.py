@@ -126,3 +126,16 @@ def test_invalid_default_fixture_loop_scope_raises_error(pytester: Pytester):
             "function, class, module, package, session."
         ]
     )
+
+
+def test_invalid_fixture_loop_scope_raises_error(pytester: Pytester) -> None:
+    pytester.makepyfile(dedent("""\
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture(loop_scope="invalid")
+        async def resource():
+            pass
+        """))
+    result = pytester.runpytest()
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(["*'invalid' is not a valid fixture loop scope*"])

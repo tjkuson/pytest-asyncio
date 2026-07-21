@@ -112,6 +112,37 @@ def test_named_hook_factories_parametrize_async_tests(pytester: Pytester) -> Non
     result.assert_outcomes(passed=2)
 
 
+def test_function_scoped_factories_do_not_reorder_test_functions(
+    pytester: Pytester,
+) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"a": asyncio.new_event_loop, "b": asyncio.new_event_loop}
+        """))
+    pytester.makepyfile(dedent("""\
+        import pytest
+
+        @pytest.mark.asyncio
+        async def test_one():
+            pass
+
+        @pytest.mark.asyncio
+        async def test_two():
+            pass
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict", "--collect-only", "-q")
+    result.stdout.fnmatch_lines(
+        [
+            "*::test_one[[]a[]]",
+            "*::test_one[[]b[]]",
+            "*::test_two[[]a[]]",
+            "*::test_two[[]b[]]",
+        ]
+    )
+
+
 def test_named_hook_factories_use_mapping_keys_as_test_ids(
     pytester: Pytester,
 ) -> None:
@@ -214,6 +245,36 @@ def test_sync_tests_without_async_fixtures_are_not_parametrized_by_hook_factorie
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=3)
+
+
+def test_no_factory_hook_does_not_parametrize_managed_items(
+    pytester: Pytester,
+) -> None:
+    pytester.makepyfile(dedent("""\
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def resource():
+            return object()
+
+        @pytest.mark.asyncio
+        async def test_async(resource, request):
+            assert resource is not None
+            callspec = getattr(request.node, "callspec", None)
+            assert callspec is None or (
+                "_pytest_asyncio_loop_factory" not in callspec.params
+            )
+
+        def test_sync(resource, request):
+            assert resource is not None
+            callspec = getattr(request.node, "callspec", None)
+            assert callspec is None or (
+                "_pytest_asyncio_loop_factory" not in callspec.params
+            )
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
 
 
 def test_hook_factories_apply_to_async_fixtures_used_by_sync_tests(

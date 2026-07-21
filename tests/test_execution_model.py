@@ -12,6 +12,14 @@ def test_pytestasyncio_function_is_removed() -> None:
 
 
 def test_event_loop_policy_fixture_is_removed(pytester: Pytester) -> None:
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        import pytest
+
+        @pytest.fixture
+        def event_loop_policy():
+            return asyncio.DefaultEventLoopPolicy()
+        """))
     pytester.makepyfile(dedent("""\
         import pytest
 
@@ -21,7 +29,9 @@ def test_event_loop_policy_fixture_is_removed(pytester: Pytester) -> None:
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(errors=1)
-    result.stdout.fnmatch_lines(["*fixture 'event_loop_policy' not found*"])
+    result.stdout.fnmatch_lines(
+        ["*event_loop_policy fixture was removed*pytest_asyncio_loop_factories*"]
+    )
 
 
 def test_marker_on_parameter_set_is_honored_at_runtime(pytester: Pytester) -> None:

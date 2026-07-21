@@ -28,7 +28,7 @@ def test_event_loop_fixture_handles_unclosed_async_gen(
     result.assert_outcomes(passed=1, warnings=0)
 
 
-def test_closing_event_loop_in_sync_fixture_teardown_raises_warning(
+def test_closing_plugin_owned_event_loop_is_an_error(
     pytester: Pytester,
 ):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
@@ -53,9 +53,12 @@ def test_closing_event_loop_in_sync_fixture_teardown_raises_warning(
                 await asyncio.sleep(0.01)
             """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", "--assert=plain")
-    result.assert_outcomes(passed=1, warnings=1)
+    result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(
-        ["*An exception occurred during teardown of an asyncio.Runner*"]
+        [
+            "*pytest-asyncio's event loop was closed before pytest-asyncio "
+            "could clean it up*"
+        ]
     )
 
 
@@ -78,4 +81,4 @@ def test_event_loop_fixture_asyncgen_error(
                 loop.shutdown_asyncgens = fail
             """))
     result = pytester.runpytest("--asyncio-mode=strict", "-W", "default")
-    result.assert_outcomes(passed=1, warnings=1)
+    result.assert_outcomes(passed=1, errors=1)
