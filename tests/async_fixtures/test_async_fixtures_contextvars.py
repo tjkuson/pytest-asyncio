@@ -2,9 +2,13 @@
 Regression test for https://github.com/pytest-dev/pytest-asyncio/issues/127:
 contextvars were not properly maintained among fixtures and tests.
 
-Async fixtures and tests see the context variables of the synchronous code that
-requested them; values set by an async fixture are copied back until its
-teardown and stay in the context of the loop's task while the loop lives.
+The task running the coroutines of an event loop starts from an empty context.
+Before each coroutine, the variables of the synchronous context that submitted
+it whose value differs are applied to the task's context; afterwards each
+applied variable is restored, unless the coroutine left it with a different
+value. The variables an async fixture's setup changed (their value after the
+setup is not their value before it) are copied into the synchronous context
+and reset there when the fixture is torn down.
 """
 
 from __future__ import annotations
@@ -78,6 +82,38 @@ def test_var_from_sync_fixture_set_after_loop_exists_propagates_to_async(
     result.assert_outcomes(passed=1)
 
 
+def test_var_from_sync_fixture_set_before_loop_exists_does_not_persist(
+    pytester: Pytester,
+):
+    """
+    The task of a loop starts from an empty context: a var a sync fixture set
+    before the task was created is seen only while the fixture lives, like one
+    set afterwards.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(_prelude + dedent("""
+        @pytest.fixture
+        def var_fixture():
+            with context_var_manager("value"):
+                yield
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first(var_fixture):
+            assert _context_var.get() == "value"
+
+        def test_sync():
+            with pytest.raises(LookupError):
+                _context_var.get()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second():
+            with pytest.raises(LookupError):
+                _context_var.get()
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=3)
+
+
 def test_var_from_async_generator_propagates_to_sync(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
@@ -117,6 +153,39 @@ def test_var_from_async_fixture_propagates_to_sync(pytester: Pytester):
     result.assert_outcomes(passed=1)
 
 
+def test_var_from_async_generator_reset_in_sync_when_teardown_fails(
+    pytester: Pytester,
+):
+    """
+    The copy of a var in the synchronous context is reset even when the
+    fixture's teardown raises.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(_prelude + dedent("""
+        @pytest.fixture
+        def check_var_reset_fixture():
+            yield
+            with pytest.raises(LookupError):
+                _context_var.get()
+            print("var reset in the synchronous context")
+
+        @pytest_asyncio.fixture
+        async def var_fixture(check_var_reset_fixture):
+            _context_var.set("value")
+            yield
+            raise ValueError("teardown error")
+
+        @pytest.mark.asyncio
+        async def test(var_fixture):
+            assert _context_var.get() == "value"
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict", "-s")
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*var reset in the synchronous context", "*ValueError: teardown error*"]
+    )
+
+
 def test_var_from_generator_reset_before_previous_fixture_cleanup(pytester: Pytester):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
@@ -139,6 +208,36 @@ def test_var_from_generator_reset_before_previous_fixture_cleanup(pytester: Pyte
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
+
+
+def test_var_reset_by_fixture_after_test_changed_it(pytester: Pytester):
+    """
+    A fixture resetting the token of a var the test then set to another value
+    leaves the var unset in the task's context; an earlier fixture's teardown
+    still runs, and sees it unset.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(_prelude + dedent("""
+        @pytest_asyncio.fixture
+        async def no_var_fixture():
+            yield
+            with pytest.raises(LookupError):
+                _context_var.get()
+            print("no_var_fixture torn down")
+
+        @pytest_asyncio.fixture
+        async def var_fixture(no_var_fixture):
+            with context_var_manager("value"):
+                yield
+
+        @pytest.mark.asyncio
+        async def test(var_fixture):
+            assert _context_var.get() == "value"
+            _context_var.set("other")
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict", "-s")
+    result.assert_outcomes(passed=1)
+    result.stdout.fnmatch_lines(["*no_var_fixture torn down"])
 
 
 def test_var_from_fixture_persists_for_previous_fixture_cleanup(pytester: Pytester):
@@ -216,6 +315,53 @@ def test_var_set_to_existing_value_ok(pytester: Pytester):
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
+
+
+def test_var_set_again_to_the_value_of_the_loop_context_is_not_copied(
+    pytester: Pytester,
+):
+    """
+    Limitation: the plugin compares the values of vars around a fixture's
+    setup, it cannot see assignments. A fixture on a shared loop setting a var
+    to the value its own previous setup left in the context of the loop's task
+    changes nothing there, so nothing is copied into the synchronous context:
+    on the second use, a sync fixture depending on it and a test on a fresh
+    function loop do not see the value.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(_prelude + dedent("""
+        VALUE = object()
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def var_fixture():
+            _context_var.set(VALUE)
+
+        @pytest.fixture
+        def check_var_fixture(var_fixture):
+            assert _context_var.get() is VALUE
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first(check_var_fixture):
+            assert _context_var.get() is VALUE
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second(check_var_fixture):
+            assert _context_var.get() is VALUE
+
+        @pytest.mark.asyncio
+        async def test_third(var_fixture):
+            assert _context_var.get() is VALUE
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1, failed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_second*",
+            "*LookupError*",
+            "*__ test_third __*",
+            "*LookupError*",
+        ]
+    )
 
 
 def test_later_fixture_on_shared_loop_propagates_only_its_own_changes(

@@ -121,36 +121,43 @@ Cancellation
 
 If a task in the group fails while a test runs, the group cancels the task running the test.
 The test fails with ``asyncio.CancelledError``, and the group raises the failure as an ``ExceptionGroup`` when the fixture is torn down, which pytest reports as an error at teardown of that fixture.
-
 A cancellation can also arrive while no test or fixture is running, for example between two tests sharing a module-scoped loop.
-pytest-asyncio then refuses to run further tests and fixture setups in that loop until the task group, cancel scope or timeout that requested the cancellation has exited, which usually means until the fixture is torn down.
-Refused tests fail with an ``asyncio.CancelledError`` that explains the refusal.
-Fixture teardowns always run, so that the requesting scope can exit.
-With the default function-scoped loop nothing else runs in the loop, so the refusal only ever affects tests that share a loop with the failed fixture.
 
-On Python 3.10, asyncio cannot report whether a cancellation request is still unresolved (``asyncio.Task.cancelling`` was added in Python 3.11).
-Once a cancellation has reached the task, a loop on Python 3.10 therefore runs only fixture teardowns until it is closed.
+Either way, the cancellation ends the normal work of that event loop.
+pytest-asyncio still runs fixture teardowns in it, so that the task group, cancel scope or timeout can exit and report what happened, but refuses to run further tests and fixture setups in the loop: they fail with an ``asyncio.CancelledError`` explaining the refusal.
+The same happens for any other cancellation of the task that a test or fixture lets propagate, for example a test cancelling its own task.
+With the default function-scoped loop, nothing else would have run in the loop anyway.
+With a wider loop scope, the remaining tests sharing the loop are refused: pytest-asyncio does not know which fixture's background work failed, and any of those tests may depend on it.
 
 Context variables
 -----------------
 
-Each event loop has one ``contextvars`` context, shared by all async fixtures and tests that run in the loop:
+The task of an event loop has one ``contextvars`` context, in which all async fixtures and tests of the loop run.
+Tests with a function-scoped loop therefore start from a fresh context, whereas tests sharing a module, class, package or session loop share theirs: a context variable set by one test is seen by the tests that follow in that loop.
+Background tasks started by tests and fixtures run in copies of the context, as always in asyncio.
 
-* Tests with a function-scoped loop start from a fresh context.
-  Tests sharing a module, class, package or session loop share their context, so a context variable set by one test is seen by the tests that follow in that loop.
-* Async code sees the context variables set by synchronous fixtures and tests.
-* Context variables set by an async fixture are seen by the synchronous fixtures and tests that depend on it, and are restored in synchronous code when the fixture is torn down.
-  In the event loop they stay set: an async generator fixture that should not leak a value to the async code that runs after it is torn down resets the variable after its ``yield``.
+pytest-asyncio moves values between that context and the context of synchronous pytest code by two rules:
+
+* Before an async fixture or test runs, the variables set in the synchronous context are applied to the loop's context, so that async code sees what synchronous fixtures and tests have set.
+  Afterwards, each applied variable is restored to its previous value in the loop's context, unless the fixture or test left it with a different value.
+  Values from the synchronous context therefore take precedence for as long as they are set there.
+* The variables an async fixture changes during its setup are applied to the synchronous context until the fixture is torn down, so that synchronous fixtures and tests depending on it see them, and so does later async code.
+
+Both rules compare values: pytest-asyncio cannot see assignments, and setting a variable to the value it already has is not a change.
+In particular, an async fixture set up more than once in the same loop, such as a function-scoped fixture with a module-scoped loop, propagates a value to synchronous code only the first time, because the loop's context keeps the value between setups.
+Reset the variable after the ``yield`` of an async generator fixture if that matters.
 
 The loop scope of a fixture or test is separate from the caching scope of the fixture.
 For example, a module-scoped fixture used by tests with function-scoped loops runs in the module's loop, so its context is not the context of any test.
-Its value is inherited through the mechanism above, not through a shared context.
+Its values reach the tests through the rules above, not through a shared context.
 
 Interruption
 ------------
 
-When a test or fixture is interrupted, for example by Ctrl-C, pytest-asyncio cancels the running coroutine and waits for it to finish, so that ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
+When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels the running coroutine and waits for it to finish, so that ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
 A second interruption abandons the coroutine.
+If a task group, cancel scope or timeout cancels the task in the meantime, the loop is treated as cancelled, as described above.
+On Python 3.10, asyncio cannot tell such a cancellation from the one pytest-asyncio requested (``Task.uncancel`` was added in Python 3.11), so there an interrupted test or fixture always leaves the loop in that state.
 
 Limitations
 -----------

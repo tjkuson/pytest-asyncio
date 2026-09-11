@@ -1,0 +1,1 @@
+AnyIO cancel scopes and task groups can span the ``yield`` of an async generator fixture without raising "Attempted to exit cancel scope in a different task".
