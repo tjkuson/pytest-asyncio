@@ -5,8 +5,10 @@ sync shim for Hypothesis.
 
 from __future__ import annotations
 
+import sys
 from textwrap import dedent
 
+import pytest
 from pytest import Pytester
 
 
@@ -93,4 +95,104 @@ def test_sync_not_auto_marked(pytester: Pytester):
             assert isinstance(n, int)
         """))
     result = pytester.runpytest("--asyncio-mode=auto")
+    result.assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize(
+    ("task_per_fixture", "values_seen"),
+    [
+        pytest.param("false", {"initial", "changed"}, id="default runner"),
+        pytest.param(
+            "true",
+            {"initial"},
+            id="experimental runner",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 11),
+                reason="asyncio_experimental_task_per_fixture requires Python 3.11",
+            ),
+        ),
+    ],
+)
+def test_examples_share_context_assignments_only_with_the_default_runner(
+    pytester: Pytester, task_per_fixture: str, values_seen: set[str]
+):
+    """With the experimental runner, each example starts from the test's context."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""
+        from contextvars import ContextVar
+
+        import pytest
+        from hypothesis import example, given, settings, strategies as st
+
+        request_id = ContextVar("request_id", default="initial")
+
+        @pytest.mark.asyncio(loop_scope="module")
+        @settings(database=None, deadline=None)
+        @example(value=False)
+        @example(value=True)
+        @given(value=st.booleans())
+        async def test_example(value):
+            with open("seen.txt", "a") as seen:
+                print(request_id.get(), file=seen)
+            request_id.set("changed")
+        """))
+
+    result = pytester.runpytest(
+        "--asyncio-mode=strict",
+        "-o",
+        f"asyncio_experimental_task_per_fixture={task_per_fixture}",
+    )
+
+    result.assert_outcomes(passed=1)
+    assert set((pytester.path / "seen.txt").read_text().split()) == values_seen
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="loop.create_task() passes task factories a context from Python 3.11",
+)
+def test_examples_keep_fixture_context_when_factory_assigns_after_task_creation(
+    pytester: Pytester,
+):
+    """A task factory's assignment does not leak into later Hypothesis examples."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""
+        import asyncio
+        from contextvars import ContextVar
+
+        import pytest
+        import pytest_asyncio
+        from hypothesis import example, given, settings, strategies as st
+
+        request_id = ContextVar("request_id")
+
+        @pytest_asyncio.fixture
+        async def task_factory():
+            request_id.set("fixture")
+            loop = asyncio.get_running_loop()
+            original_factory = loop.get_task_factory()
+
+            def create_task(loop, coro, context=None):
+                task = asyncio.Task(coro, loop=loop, context=context)
+                request_id.set("factory")
+                return task
+
+            loop.set_task_factory(create_task)
+            try:
+                yield
+            finally:
+                loop.set_task_factory(original_factory)
+
+        @pytest.mark.usefixtures("task_factory")
+        @pytest.mark.asyncio
+        @settings(database=None, deadline=None)
+        @example(value=False)
+        @example(value=True)
+        @given(value=st.booleans())
+        async def test_example(value):
+            assert request_id.get() == "fixture"
+        """))
+
+    result = pytester.runpytest("--asyncio-mode=strict")
+
     result.assert_outcomes(passed=1)
