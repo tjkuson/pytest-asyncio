@@ -51,6 +51,7 @@ optional-dependencies.docs = [
   "sphinx-tabs>=3.5",
 ]
 optional-dependencies.testing = [
+  "anyio>=4",
   "coverage>=6.2",
   "hypothesis>=5.7.1",
 ]
@@ -70,6 +71,7 @@ dev = [
   { include-group = "typing" },
 ]
 test = [
+  "anyio>=4",
   "coverage>=6.2",
   "hypothesis>=5.7.1",
 ]
