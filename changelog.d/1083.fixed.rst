@@ -1,1 +1,1 @@
-An ``asyncio.TaskGroup`` or ``asyncio.timeout`` can span the ``yield`` of an async generator fixture. pytest-asyncio runs the setup and teardown of async fixtures and the tests of an event loop in a single task, so the task that enters such a scope is the task that exits it.
+An ``asyncio.TaskGroup`` or ``asyncio.timeout`` can span the ``yield`` of an async generator fixture. pytest-asyncio runs the setup and teardown of such a fixture in one task, so the task that enters the scope is the task that exits it.

@@ -1,13 +1,15 @@
 """
 The other tests on a shared event loop after a cancellation.
 
-Every coroutine of an event loop scope runs in one long-lived task. Once
-that task has been cancelled, by a scope of the user's (a task group,
-cancel scope or timeout spanning a fixture's yield, a test cancelling its
-own task) or by the runner to interrupt a job, it runs nothing but fixture
-teardowns until the loop closes. A refused test fails with CancelledError;
-a refused fixture setup errors with PytestAsyncioError, the refusal as its
-cause. A function-scoped loop closes right after its test.
+Every test and fixture of an event loop scope runs in a task of its own, so
+a cancellation ends the test or fixture whose task it reached and nothing
+else: the later tests on the loop run. The exception is an async generator
+fixture's task cancelled as it waits at its yield, by a task group, cancel
+scope or timeout spanning the yield or by a test cancelling every task: the
+loop then runs nothing but fixture teardowns until it closes. A refused test
+fails with CancelledError; a refused fixture setup errors with
+PytestAsyncioError, the refusal as its cause. A function-scoped loop closes
+right after its test.
 """
 
 from __future__ import annotations
@@ -41,8 +43,10 @@ def _run(
     return pytester.runpytest("--asyncio-mode=strict", "-s", *args)
 
 
-_SELF_CANCELLATION_SOURCE = """
+# The test cancels its own task, or every task of its loop.
+_CANCELLING_TEST_SOURCE = """
     import asyncio
+    import contextlib
     import pytest
     import pytest_asyncio
 
@@ -67,39 +71,62 @@ _SELF_CANCELLATION_SOURCE = """
 """
 
 
-@pytest.mark.parametrize("scope", ["function", "module"])
 @pytest.mark.parametrize(
-    ("cancel", "after"),
+    ("after", "failed"),
     [
-        ("asyncio.current_task().cancel()", "await asyncio.sleep(0)"),
-        ("for task in asyncio.all_tasks(): task.cancel()", "await asyncio.sleep(0)"),
-        ("asyncio.current_task().cancel()", "pass"),
+        pytest.param("await asyncio.sleep(0)", 1, id="propagated"),
+        pytest.param("pass", 1, id="at_return"),
+        pytest.param(
+            "with contextlib.suppress(asyncio.CancelledError): await asyncio.sleep(0)",
+            0,
+            id="swallowed",
+        ),
     ],
-    ids=["own_task", "every_task", "at_return"],
 )
-def test_unresolved_self_cancellation(
-    pytester: Pytester, scope: str, cancel: str, after: str
+def test_self_cancellation_affects_only_the_culprit(
+    pytester: Pytester, after: str, failed: int
 ):
     """
-    Nobody resolves a request the test makes of its own task. Propagated, it
-    fails the test with CancelledError; made at return, with no later await,
-    it lands on the task as it waits for the next job and the test passes.
-    Either way the test's fixture is torn down, and on a shared loop nothing
-    but fixture teardowns runs until the loop closes.
+    A test that cancels its own task fails with CancelledError, whether it
+    lets the cancellation propagate or returns before it is delivered, and
+    passes if it swallows it. Its fixture is torn down either way, and the
+    later tests on the shared loop run.
     """
-    source = _SELF_CANCELLATION_SOURCE.format(scope=scope, cancel=cancel, after=after)
+    source = _CANCELLING_TEST_SOURCE.format(
+        scope="module", cancel="asyncio.current_task().cancel()", after=after
+    )
     result = _run(pytester, source)
-    culprit_failed = int(after != "pass")
-    if culprit_failed:
+    result.assert_outcomes(failed=failed, passed=3 - failed)
+    if failed:
         result.stdout.fnmatch_lines(["*_ test_cancel _*", "*CancelledError*"])
+    assert result.stdout.str().count("RESOURCE TORN DOWN") == 2
+    result.stdout.fnmatch_lines(["*NEXT RAN*", "*WITH FIXTURE RAN*"])
+
+
+@pytest.mark.parametrize("scope", ["function", "module"])
+def test_cancelling_every_task_reaches_the_fixture_at_its_yield(
+    pytester: Pytester, scope: str
+):
+    """
+    asyncio.all_tasks() holds the tasks of the fixtures waiting at their
+    yield, and the runner's wait for the test. The test fails with
+    CancelledError; the fixture's task, cancelled at its yield, makes its
+    loop teardown-only until it closes: right after the test on a function
+    loop, at the end of the module on a module loop.
+    """
+    source = _CANCELLING_TEST_SOURCE.format(
+        scope=scope,
+        cancel="for task in asyncio.all_tasks(): task.cancel()",
+        after="await asyncio.sleep(0)",
+    )
+    result = _run(pytester, source)
+    result.stdout.fnmatch_lines(["*_ test_cancel _*", "*CancelledError*"])
     out = result.stdout.str()
     if scope == "function":
-        result.assert_outcomes(failed=culprit_failed, passed=3 - culprit_failed)
+        result.assert_outcomes(failed=1, passed=2)
         assert out.count("RESOURCE TORN DOWN") == 2
         return
-    result.assert_outcomes(
-        failed=1 + culprit_failed, passed=1 - culprit_failed, errors=1
-    )
+    result.assert_outcomes(failed=2, errors=1)
     assert out.count("RESOURCE TORN DOWN") == 1
     assert "NEXT RAN" not in out
     assert "WITH FIXTURE RAN" not in out
@@ -113,42 +140,56 @@ def test_unresolved_self_cancellation(
     )
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 11),
-    reason="asyncio.timeout() and Task.uncancel() need Python 3.11",
-)
-@pytest.mark.parametrize("resolve", ["pass", "task.uncancel()"])
-def test_swallowed_self_cancellation_admits_later_tests(
-    pytester: Pytester, resolve: str
-):
+def test_fixture_cancelled_during_its_setup_fails_only_its_test(pytester: Pytester):
     """
-    The task never saw the cancellation, so nothing is refused; a request
-    left unresolved by a test that does not call uncancel() does not upset a
-    later timeout either (asyncio counts requests relatively).
+    A cancellation of a fixture's task before its yield is a failed setup
+    of that fixture, reported as PytestAsyncioError, whether the fixture is
+    a coroutine or an async generator; the later tests on the shared loop
+    run.
     """
     result = _run(
         pytester,
-        f"""
+        """
         import asyncio
         import pytest
+        import pytest_asyncio
+
+        async def cancel_self():
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def cancelled_coroutine():
+            await cancel_self()
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def cancelled_generator():
+            await cancel_self()
+            yield
 
         @pytest.mark.asyncio(loop_scope="module")
-        async def test_swallow():
-            task = asyncio.current_task()
-            task.cancel()
-            try:
-                await asyncio.sleep(0)
-            except asyncio.CancelledError:
-                {resolve}
+        async def test_coroutine(cancelled_coroutine):
+            pass
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_generator(cancelled_generator):
+            pass
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next():
-            with pytest.raises(TimeoutError):
-                async with asyncio.timeout(0.01):
-                    await asyncio.sleep(1)
+            print("NEXT RAN")
         """,
     )
-    result.assert_outcomes(passed=2)
+    result.assert_outcomes(passed=1, errors=2)
+    result.stdout.fnmatch_lines(
+        [
+            "*NEXT RAN*",
+            "*ERROR at setup of test_coroutine*",
+            "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
+            "*ERROR at setup of test_generator*",
+            "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
+        ]
+    )
 
 
 _FAILED_SERVICE_SOURCE = """
@@ -226,26 +267,28 @@ def _run_failed_service(pytester: Pytester, library: str, fixture_scope: str):
     out = result.stdout.str()
     assert "USED SERVICE" not in out
     assert "UNRELATED RAN" not in out
-    # AnyIO's cancelled scope cancels the awaiting teardown again.
-    assert ("UNRELATED TORN DOWN" in out) is (library == "asyncio")
-    result.stdout.fnmatch_lines(["*OWN LOOP RAN*", "*NEXT MODULE RAN*"])
+    # The unrelated fixture's task is outside the cancelled scope.
+    result.stdout.fnmatch_lines(
+        ["*UNRELATED TORN DOWN*", "*OWN LOOP RAN*", "*NEXT MODULE RAN*"]
+    )
     return result
 
 
 @pytest.mark.parametrize(
     "library", [pytest.param("asyncio", marks=_NEEDS_TASK_GROUP), "anyio"]
 )
-def test_failed_module_fixture_quarantines_its_loop_until_it_closes(
+def test_failed_module_fixture_makes_its_loop_teardown_only_until_it_closes(
     pytester: Pytester, library: str
 ):
     """
-    Every later test and fixture setup on the module loop is refused;
-    fixture teardowns run; a function-loop test has its own task; the next
-    module starts with a fresh loop. The group exits at the module teardown
+    The test running when the child failed is cancelled; every later test
+    and fixture setup on the module loop is refused; fixture teardowns run,
+    each in its own task; a function-loop test has its own loop; the next
+    module starts with a fresh one. The group exits at the module teardown
     and reports its error once, there.
     """
     result = _run_failed_service(pytester, library, "module")
-    result.assert_outcomes(failed=2, passed=2, errors=2 + (library == "anyio"))
+    result.assert_outcomes(failed=2, passed=2, errors=2)
     result.stdout.fnmatch_lines(
         [
             "*ERROR at setup of test_unrelated*",
@@ -261,7 +304,7 @@ def test_failed_module_fixture_quarantines_its_loop_until_it_closes(
 @pytest.mark.parametrize(
     "library", [pytest.param("asyncio", marks=_NEEDS_TASK_GROUP), "anyio"]
 )
-def test_failed_function_fixture_quarantines_its_loop_until_it_closes(
+def test_failed_function_fixture_makes_its_loop_teardown_only_until_it_closes(
     pytester: Pytester, library: str
 ):
     """
@@ -308,37 +351,29 @@ _LOOP_CONTROL_SOURCE = """
 """
 
 
-def test_test_stops_the_running_loop(pytester: Pytester):
+@pytest.mark.parametrize(
+    ("action", "error"),
+    [
+        ("stop", "Event loop stopped before Future completed"),
+        ("close", "Cannot close a running event loop"),
+    ],
+)
+def test_test_stops_or_closes_the_running_loop(
+    pytester: Pytester, action: str, error: str
+):
     """
     Stopping the loop interrupts the wait for the test: the runner cancels
-    the task, the test ends at its await and fails with asyncio's error, and
-    the shared loop runs nothing but fixture teardowns from then on.
+    the test's task, which ends at its await, and raises asyncio's error.
+    Closing a running loop is refused by asyncio in the test itself. Either
+    way the test fails and the shared loop goes on.
     """
-    result = _run(pytester, _LOOP_CONTROL_SOURCE.format(action="stop"))
-    result.assert_outcomes(failed=1, errors=1)
-    out = result.stdout.str()
-    assert "TEST CONTINUED" not in out
-    assert "NEXT RAN" not in out
-    assert out.count("RESOURCE TORN DOWN") == 1
-    result.stdout.fnmatch_lines(
-        [
-            "*ERROR at setup of test_next*",
-            *_REFUSED_SETUP,
-            "*_ test_stop _*",
-            "*RuntimeError: Event loop stopped before Future completed*",
-        ]
-    )
-
-
-def test_test_closes_the_running_loop(pytester: Pytester):
-    """Closing a running loop is refused by asyncio: the test fails with its error."""
-    result = _run(pytester, _LOOP_CONTROL_SOURCE.format(action="close"))
+    result = _run(pytester, _LOOP_CONTROL_SOURCE.format(action=action))
     result.assert_outcomes(failed=1, passed=1)
     out = result.stdout.str()
     assert "TEST CONTINUED" not in out
     assert out.count("RESOURCE TORN DOWN") == 2
     result.stdout.fnmatch_lines(
-        ["*NEXT RAN*", "*RuntimeError: Cannot close a running event loop*"]
+        ["*NEXT RAN*", f"*_ test_{action} _*", f"*RuntimeError: {error}*"]
     )
 
 
@@ -415,9 +450,10 @@ def test_user_drives_the_shared_loop_after_an_anyio_scope_was_cancelled(
     pytester: Pytester,
 ):
     """
-    AnyIO cancels the idle task again on every iteration of the loop the sync
-    test drives; the user's coroutine completes and the task survives to
-    refuse the next test and to tear the fixture down.
+    AnyIO cancels the fixture's task again on every iteration of the loop
+    the sync test drives; the task keeps waiting at the yield, the user's
+    coroutine completes, the next test is refused, and the fixture's
+    teardown exits the scope and reports the error.
     """
     result = _run(
         pytester,

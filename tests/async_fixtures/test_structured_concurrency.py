@@ -1,9 +1,10 @@
 """
 Task groups, cancel scopes and timeouts spanning the yield of an async fixture.
 
-Every coroutine of an event loop scope runs in one long-lived task, so a scope
-entered before a fixture's yield is exited by the same task at its teardown
-(issues #1083 and #1191); these tests specify how failures in it are reported.
+Every async fixture and test runs in a task of its own, and an async generator
+fixture's task lives on across its yield, so a scope entered before the yield
+is exited by the same task at teardown (issues #1083 and #1191); these tests
+specify how failures in such a scope are reported.
 """
 
 from __future__ import annotations
@@ -66,60 +67,74 @@ def _timeout(library: str) -> tuple[str, str]:
     return "with anyio.fail_after(None)", "deadline.deadline = anyio.current_time()"
 
 
-@pytest.mark.parametrize("scope", ["function", "module"])
-def test_one_task_per_loop_scope(pytester: Pytester, scope: str):
-    """Fixtures, tests and hypothesis examples of a loop scope share one task."""
-    pytester.makeini(f"[pytest]\nasyncio_default_fixture_loop_scope = {scope}")
-    pytester.makepyfile(dedent(f"""\
+def test_one_task_per_fixture_and_test(pytester: Pytester):
+    """
+    Each fixture, test and hypothesis example of a loop runs in a task of its
+    own, named after it; a generator fixture's setup and teardown share a task.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makepyfile(dedent("""\
         import asyncio
+        import sys
         import pytest
         import pytest_asyncio
         from hypothesis import given, settings, strategies as st
 
-        tasks = {{"setup": set(), "teardown": set(), "test": set(), "example": set()}}
+        tasks = {}
+        examples = []
 
         def record(phase):
-            tasks[phase].add(asyncio.current_task())
+            tasks[phase] = asyncio.current_task()
 
         @pytest_asyncio.fixture
         async def generator():
-            record("setup")
+            record("generator setup")
             yield
-            record("teardown")
+            record("generator teardown")
 
         @pytest_asyncio.fixture
         async def coroutine(generator):
-            record("setup")
+            record("coroutine")
 
-        @pytest.mark.asyncio(loop_scope={scope!r})
+        @pytest.mark.asyncio(loop_scope="module")
         async def test_plain(coroutine):
-            record("test")
+            record("test_plain")
+            # The task runs the test's own coroutine.
+            assert asyncio.current_task().get_coro().cr_frame is sys._getframe()
 
-        @pytest.mark.asyncio(loop_scope={scope!r})
+        @pytest.mark.asyncio(loop_scope="module")
         @settings(max_examples=3, deadline=None, database=None)
         @given(st.integers())
         async def test_examples(n):
-            record("example")
+            examples.append(asyncio.current_task())
 
         def test_tasks():
-            assert tasks["setup"] == tasks["teardown"] == tasks["test"]
-            assert len(tasks["test"]) == len(tasks["example"]) == 1
-            assert (tasks["example"] == tasks["test"]) is ({scope!r} == "module")
-            names = {{task.get_name() for task in tasks["test"] | tasks["example"]}}
-            assert names == {{"pytest-asyncio"}}
+            assert tasks["generator setup"] is tasks["generator teardown"]
+            own = [tasks["generator setup"], tasks["coroutine"], tasks["test_plain"]]
+            assert len(examples) > 1
+            assert len({*own, *examples}) == len(own) + len(examples)
+            names = [task.get_name() for task in own + examples]
+            assert names == ["generator", "coroutine", "test_plain"] + (
+                ["test_examples"] * len(examples)
+            )
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=3)
 
 
-@pytest.mark.parametrize("phase", ["test", "setup"])
+@pytest.mark.parametrize("phase", ["fixture", "setup", "test"])
 @pytest.mark.parametrize("library", _LIBRARIES)
 def test_child_failing_cancels_the_running_phase(
     pytester: Pytester, library: str, phase: str
 ):
-    """Issues #1083 and #1191: the test or a dependent's setup is cancelled."""
+    """
+    Issues #1083 and #1191. A child failing during the fixture's own setup makes
+    its group the setup error, and the loop goes on. A child failing at the yield
+    cancels the dependent's setup or the test running at the time; the group is
+    reported at the fixture's teardown, and later tests on the loop are refused.
+    """
     group, start = _task_group(library, "fail", "forever")
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import {library}
@@ -142,6 +157,9 @@ def test_child_failing_cancels_the_running_phase(
 
             async with {group} as group:
                 {start}
+                if {phase!r} == "fixture":
+                    trigger.set()
+                    await asyncio.Event().wait()
                 yield trigger
 
         @pytest_asyncio.fixture
@@ -151,36 +169,55 @@ def test_child_failing_cancels_the_running_phase(
                 await asyncio.Event().wait()
             yield service
 
-        @pytest.mark.asyncio
+        @pytest.mark.asyncio(loop_scope="module")
         async def test_service(dependent):
             dependent.set()
             await asyncio.Event().wait()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_after():
+            await asyncio.sleep(0)
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", "-s", timeout=30)
-    teardown = [
-        "*ERROR at teardown of test_service*",
+    group_error = [
         "*ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)*",
         "*RuntimeError: background service failed*",
     ]
-    if phase == "test":
-        result.assert_outcomes(failed=1, errors=1)
-        lines = [*teardown, "*_ test_service _*", *_CANCELLED]
-    else:
-        result.assert_outcomes(errors=2)
+    if phase == "fixture":
+        result.assert_outcomes(errors=1, passed=1)
+        lines = ["*ERROR at setup of test_service*", *group_error]
+    elif phase == "setup":
+        result.assert_outcomes(errors=2, failed=1)
         lines = [
             "*ERROR at setup of test_service*",
             *_fixture_cancelled("setup"),
-            *teardown,
+            "*ERROR at teardown of test_service*",
+            *group_error,
+            "*_ test_after _*",
+            _REFUSED,
+        ]
+    else:
+        result.assert_outcomes(failed=2, errors=1)
+        lines = [
+            "*ERROR at teardown of test_service*",
+            *group_error,
+            "*_ test_service _*",
+            *_CANCELLED,
+            "*_ test_after _*",
+            _REFUSED,
         ]
     result.stdout.fnmatch_lines(lines)
     assert "SIBLING CANCELLED" in result.stdout.str()
 
 
 @pytest.mark.parametrize("library", _LIBRARIES)
-def test_child_failing_while_idle_refuses_the_next_test(
+def test_child_failing_between_tests_refuses_the_next_test(
     pytester: Pytester, library: str
 ):
-    """A cancellation landing on the idle task refuses the next non-teardown job."""
+    """
+    A child failing while no test runs cancels the fixture's task at its yield:
+    later tests on the loop are refused, and its teardown reports the error.
+    """
     group, start = _task_group(library, "fail")
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
     pytester.makepyfile(dedent(f"""\
@@ -253,13 +290,13 @@ def test_anyio_scopes_span_the_yield(pytester: Pytester):
     ],
     ids=["asyncio", "anyio", "anyio-shielded"],
 )
-def test_dependent_teardown_inside_cancelled_scope(
+def test_dependent_teardown_outside_cancelled_scope(
     pytester: Pytester, library: str, cleanup: str
 ):
     """
-    The dependent is torn down first, inside the cancelled scope of its parent:
-    asyncio cancels once, so its awaited cleanup completes; AnyIO cancels every
-    await in the scope, so the cleanup is cancelled unless it is shielded.
+    The dependent is torn down first, in its own task rather than inside the
+    cancelled scope of its parent, so its awaited cleanup completes with either
+    library, shielded or not; the parent's teardown then reports the error.
     """
     group, start = _task_group(library, "fail")
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
@@ -305,15 +342,14 @@ def test_dependent_teardown_inside_cancelled_scope(
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", "-s", timeout=30)
     result.assert_outcomes(failed=1, errors=1)
-    cleanup_cancelled = library == "anyio" and "shield" not in cleanup
-    assert ("TRANSACTION CLEANED UP" in result.stdout.str()) is not cleanup_cancelled
     result.stdout.fnmatch_lines(
-        ["*CONNECTION CLOSED*", "*ERROR at teardown of test_transaction*"]
+        [
+            "*TRANSACTION CLEANED UP*",
+            "*CONNECTION CLOSED*",
+            "*ERROR at teardown of test_transaction*",
+            "*RuntimeError: connection worker failed*",
+        ]
     )
-    # Both teardown errors are in one exception group, in pytest's order.
-    result.stdout.fnmatch_lines(["*RuntimeError: connection worker failed*"])
-    if cleanup_cancelled:
-        result.stdout.fnmatch_lines(_fixture_cancelled("teardown"))
 
 
 @pytest.mark.parametrize("library", _LIBRARIES)
@@ -389,8 +425,8 @@ def test_timeout_spanning_yield_expires_while_idle(pytester: Pytester, library: 
 
 def test_overlapping_parametrized_module_fixtures(pytester: Pytester):
     """
-    AnyIO scopes must be exited in LIFO order within a task: a parametrized
-    module fixture torn down while a later one is alive fails to exit its scope.
+    A parametrized module fixture is torn down while a later one is still alive:
+    each AnyIO scope is in a task of its own, so no LIFO order binds fixtures.
     """
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
     pytester.makepyfile(dedent("""\
@@ -417,16 +453,17 @@ def test_overlapping_parametrized_module_fixtures(pytester: Pytester):
             print(f"TEST {first}")
         """))
     result = pytester.runpytest("--asyncio-mode=strict", "-s")
-    result.assert_outcomes(passed=1, errors=1)
+    result.assert_outcomes(passed=2)
     result.stdout.fnmatch_lines(
         [
             "*OPEN FIRST 1*",
             "*OPEN SECOND*",
+            "*TEST 1*",
             "*CLOSE FIRST 1*",
+            "*OPEN FIRST 2*",
+            "*TEST 2*",
+            "*CLOSE FIRST 2*",
             "*CLOSE SECOND*",
-            "*ERROR at setup of test_pair[[]2]*",
-            "*RuntimeError: Attempted to exit a cancel scope that isn't the "
-            "current task*",
         ]
     )
 

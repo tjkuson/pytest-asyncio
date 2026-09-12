@@ -7,7 +7,7 @@ Markers
 ``pytest.mark.asyncio``
 =======================
 A coroutine or async generator with this marker is treated as a test function by pytest.
-The marked function is executed as a coroutine in the event loop provided by pytest-asyncio (see :ref:`concepts/tasks`).
+The marked function is executed as an asyncio task in the event loop provided by pytest-asyncio (see :ref:`concepts/tasks`).
 
 Multiple async tests in a single class or module can be marked in different ways:
 

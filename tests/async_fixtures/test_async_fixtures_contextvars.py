@@ -437,35 +437,80 @@ def test_var_from_async_generator_reset_in_sync_when_teardown_fails(
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="Task.get_context() requires Python 3.12"
 )
-def test_current_task_context_is_not_the_context_of_the_coroutine(
-    pytester: Pytester,
-):
+def test_current_task_context_is_the_context_of_the_coroutine(pytester: Pytester):
     """
-    Known difference from running each coroutine in a task of its own: every
-    coroutine of a loop runs in one task, so ``asyncio.current_task().get_context()``
-    is that task's context, not the coroutine's; ``contextvars.copy_context()``
-    is the coroutine's.
+    Each fixture and test runs in a task of its own, so
+    ``asyncio.current_task().get_context()`` is the coroutine's own context:
+    it holds the value the coroutine set, and not one another coroutine set.
     """
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         import asyncio
-        import contextvars
 
-        def check_contexts(value):
-            assert contextvars.copy_context()[_context_var] == value
-            assert _context_var not in asyncio.current_task().get_context()
+        def check_context(value):
+            assert asyncio.current_task().get_context()[_context_var] == value
 
         @pytest_asyncio.fixture
         async def var_fixture():
             with context_var_manager("fixture value"):
-                check_contexts("fixture value")
+                check_context("fixture value")
                 yield
-                check_contexts("fixture value")
+                check_context("fixture value")
 
         @pytest.mark.asyncio
         async def test(var_fixture):
             _context_var.set("test value")
-            check_contexts("test value")
+            check_context("test value")
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1)
+
+
+def test_var_from_task_factory_seen_by_async_fixture_sync_dependent_and_test(
+    pytester: Pytester,
+):
+    """
+    Each fixture and test runs in a task the loop's task factory created, so a
+    var the factory supplies to the task's context is seen by the async
+    fixture, by a sync fixture depending on it and by the test.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        import contextvars
+
+        trace = contextvars.ContextVar("trace")
+
+        def traced_task_factory(loop, coro, **kwargs):
+            context = contextvars.copy_context()
+            context.run(trace.set, "instrumented")
+            return context.run(asyncio.Task, coro, loop=loop, **kwargs)
+
+        def traced_loop_factory():
+            loop = asyncio.new_event_loop()
+            loop.set_task_factory(traced_task_factory)
+            return loop
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"traced": traced_loop_factory}
+        """))
+    pytester.makepyfile(dedent("""\
+        import pytest
+        import pytest_asyncio
+
+        from conftest import trace
+
+        @pytest_asyncio.fixture
+        async def traced_fixture():
+            assert trace.get() == "instrumented"
+
+        @pytest.fixture
+        def sync_dependent(traced_fixture):
+            assert trace.get() == "instrumented"
+
+        @pytest.mark.asyncio
+        async def test(sync_dependent):
+            assert trace.get() == "instrumented"
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
