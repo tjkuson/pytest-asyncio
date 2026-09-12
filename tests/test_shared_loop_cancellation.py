@@ -1,10 +1,13 @@
 """
 The other tests on a shared event loop after a cancellation.
 
-Every coroutine of an event loop scope runs in one long-lived task. Once a
-CancelledError that the runner did not request has reached that task, it
-runs nothing but fixture teardowns until the loop closes. A function-scoped
-loop closes right after its test.
+Every coroutine of an event loop scope runs in one long-lived task. Once
+that task has been cancelled, by a scope of the user's (a task group,
+cancel scope or timeout spanning a fixture's yield, a test cancelling its
+own task) or by the runner to interrupt a job, it runs nothing but fixture
+teardowns until the loop closes. A refused test fails with CancelledError;
+a refused fixture setup errors with PytestAsyncioError, the refusal as its
+cause. A function-scoped loop closes right after its test.
 """
 
 from __future__ import annotations
@@ -16,14 +19,13 @@ import pytest
 from pytest import Pytester
 
 _REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed."
+# pytest prints the cause of a fixture's PytestAsyncioError first.
+_REFUSED_SETUP = [
+    _REFUSED,
+    "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
+]
 _NEEDS_TASK_GROUP = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
-)
-_INTERRUPTED_JOB_CANCELS_ON_310 = pytest.mark.xfail(
-    sys.version_info < (3, 11),
-    reason="Python 3.10 cannot count cancellation requests: an interrupted job "
-    "leaves the task cancelled",
-    strict=True,
 )
 
 
@@ -102,7 +104,12 @@ def test_unresolved_self_cancellation(
     assert "NEXT RAN" not in out
     assert "WITH FIXTURE RAN" not in out
     result.stdout.fnmatch_lines(
-        ["*ERROR at setup of test_with_fixture*", _REFUSED, "*_ test_next _*", _REFUSED]
+        [
+            "*ERROR at setup of test_with_fixture*",
+            *_REFUSED_SETUP,
+            "*_ test_next _*",
+            _REFUSED,
+        ]
     )
 
 
@@ -242,7 +249,7 @@ def test_failed_module_fixture_quarantines_its_loop_until_it_closes(
     result.stdout.fnmatch_lines(
         [
             "*ERROR at setup of test_unrelated*",
-            _REFUSED,
+            *_REFUSED_SETUP,
             "*ERROR at teardown of test_unrelated*",
             "*RuntimeError: background service failed*",
             "*_ test_uses_service _*",
@@ -270,63 +277,69 @@ def test_failed_function_fixture_quarantines_its_loop_until_it_closes(
             "*ERROR at teardown of test_trigger*",
             "*RuntimeError: background service failed*",
             "*ERROR at setup of test_uses_service*",
-            _REFUSED,
+            *_REFUSED_SETUP,
             "*ERROR at setup of test_unrelated*",
-            _REFUSED,
+            *_REFUSED_SETUP,
         ]
     )
 
 
-@pytest.mark.parametrize(
-    ("action", "error"),
-    [
-        pytest.param(
-            "stop",
-            "Event loop stopped before Future completed",
-            id="stop",
-            marks=_INTERRUPTED_JOB_CANCELS_ON_310,
-        ),
-        pytest.param("close", "Cannot close a running event loop", id="close"),
-    ],
-)
-def test_test_stops_or_closes_the_running_loop(
-    pytester: Pytester, action: str, error: str
-):
+# The test does something to the running loop; what depends on it.
+_LOOP_CONTROL_SOURCE = """
+    import asyncio
+    import pytest
+    import pytest_asyncio
+
+    @pytest_asyncio.fixture(loop_scope="module")
+    async def resource():
+        yield
+        await asyncio.sleep(0)
+        print("RESOURCE TORN DOWN")
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_{action}(resource):
+        asyncio.get_running_loop().{action}()
+        await asyncio.sleep(0)
+        print("TEST CONTINUED")
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_next(resource):
+        print("NEXT RAN")
+"""
+
+
+def test_test_stops_the_running_loop(pytester: Pytester):
     """
     Stopping the loop interrupts the wait for the test: the runner cancels
-    the test, which ends at its next await, and resolves that one request,
-    so the shared loop stays usable. Closing the loop is refused by asyncio.
-    Either way the test fails with asyncio's error.
+    the task, the test ends at its await and fails with asyncio's error, and
+    the shared loop runs nothing but fixture teardowns from then on.
     """
-    result = _run(
-        pytester,
-        f"""
-        import asyncio
-        import pytest
-        import pytest_asyncio
-
-        @pytest_asyncio.fixture(loop_scope="module")
-        async def resource():
-            yield
-            await asyncio.sleep(0)
-            print("RESOURCE TORN DOWN")
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_{action}(resource):
-            asyncio.get_running_loop().{action}()
-            await asyncio.sleep(0)
-            print("TEST CONTINUED")
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_next(resource):
-            print("NEXT RAN")
-        """,
+    result = _run(pytester, _LOOP_CONTROL_SOURCE.format(action="stop"))
+    result.assert_outcomes(failed=1, errors=1)
+    out = result.stdout.str()
+    assert "TEST CONTINUED" not in out
+    assert "NEXT RAN" not in out
+    assert out.count("RESOURCE TORN DOWN") == 1
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_next*",
+            *_REFUSED_SETUP,
+            "*_ test_stop _*",
+            "*RuntimeError: Event loop stopped before Future completed*",
+        ]
     )
+
+
+def test_test_closes_the_running_loop(pytester: Pytester):
+    """Closing a running loop is refused by asyncio: the test fails with its error."""
+    result = _run(pytester, _LOOP_CONTROL_SOURCE.format(action="close"))
     result.assert_outcomes(failed=1, passed=1)
     out = result.stdout.str()
     assert "TEST CONTINUED" not in out
     assert out.count("RESOURCE TORN DOWN") == 2
-    result.stdout.fnmatch_lines(["*NEXT RAN*", f"*RuntimeError: {error}*"])
+    result.stdout.fnmatch_lines(
+        ["*NEXT RAN*", "*RuntimeError: Cannot close a running event loop*"]
+    )
 
 
 def test_sync_test_closes_the_shared_loop(pytester: Pytester):

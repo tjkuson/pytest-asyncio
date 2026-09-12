@@ -10,14 +10,11 @@ from collections.abc import AsyncGenerator, Iterator
 from typing import TypeVar
 
 import pytest
+import pytest_asyncio._runner
 from pytest_asyncio._runner import TaskRunner
 
-_INTERRUPTION_CANCELS_ON_310 = pytest.mark.xfail(
-    sys.version_info < (3, 11),
-    raises=asyncio.CancelledError,
-    reason="Python 3.10 cannot count cancellation requests: an interrupted job "
-    "leaves the task cancelled",
-    strict=True,
+_REQUIRES_311 = pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Task.cancelling() needs Python 3.11"
 )
 _REFUSED = "The coroutine was refused"
 _T = TypeVar("_T")
@@ -79,6 +76,14 @@ async def _anext(gen: AsyncGenerator[_T]) -> _T:
     return await gen.__anext__()
 
 
+def _assert_teardown_only(runner: TaskRunner) -> None:
+    refused = _never_started()
+    with pytest.raises(asyncio.CancelledError, match=_REFUSED):
+        runner.run(refused)
+    assert refused.cr_frame is None
+    runner.run(_nothing(), teardown=True)
+
+
 def test_jobs_run_one_after_another_in_the_same_task():
     """The setup and teardown of a fixture and the tests share one task."""
     tasks = []
@@ -128,82 +133,73 @@ def test_run_is_refused_from_a_running_loop():
         runner.run(job())
 
 
-def test_jobs_see_the_submitting_context_and_the_task_keeps_its_own():
+def test_a_job_runs_in_the_given_context():
     """
-    The variables of the context submitting a job are applied to the task's
-    context for that job. What a job sets stays in the task's context for the
-    lifetime of the loop and never reaches the submitting context.
+    A job reads and writes the context passed to run(), and nothing else: not
+    the submitting context, not the context of another job.
     """
+    context = contextvars.copy_context()
     with TaskRunner() as runner:
-        runner.run(_set("from job"))
-        assert runner.run(_get()) == "from job"
+        runner.run(_set("in job"), context=context)
+        assert context[_var] == "in job"
         assert _var.get("unset") == "unset"
-        with _set_in_sync("from sync"):
-            assert runner.run(_get()) == "from sync"
-        assert runner.run(_get()) == "from job"
-
-
-def test_the_task_starts_from_an_empty_context():
-    """A variable set before the loop's task exists is applied for a job at a time."""
-    with _set_in_sync("from sync"):
-        runner = TaskRunner().__enter__()
-    with contextlib.closing(runner):
         assert runner.run(_get()) == "unset"
+        assert runner.run(_get(), context=context) == "in job"
+
+
+def test_a_job_runs_in_a_copy_of_the_current_context_by_default():
+    """As with asyncio.Runner.run(): a job sees what was set when it was run."""
+    with TaskRunner() as runner:
         with _set_in_sync("from sync"):
             assert runner.run(_get()) == "from sync"
         assert runner.run(_get()) == "unset"
 
 
-def test_a_variable_the_job_changed_keeps_its_new_value():
-    """An applied variable is restored after the job unless the job changed it."""
-    with TaskRunner() as runner:
-        with _set_in_sync("from sync"):
-            runner.run(_set("from job"))
-        assert runner.run(_get()) == "from job"
+def test_tasks_and_callbacks_of_a_job_copy_its_context():
+    """Whatever a job starts inherits the job's context, as usual in asyncio."""
 
-
-def test_a_variable_the_job_reset_stays_reset():
-    """
-    Resetting a token, as an async generator fixture does after its yield,
-    unsets the variable, whatever a job set meanwhile and whatever value the
-    submitting context applied.
-    """
-
-    async def set_with_token() -> contextvars.Token[str]:
-        return _var.set("from fixture")
-
-    async def reset(token: contextvars.Token[str]) -> None:
-        _var.reset(token)
+    async def job() -> tuple[str, str]:
+        _var.set("in job")
+        loop = asyncio.get_running_loop()
+        from_callback = loop.create_future()
+        loop.call_soon(lambda: from_callback.set_result(_var.get("unset")))
+        return await asyncio.create_task(_get()), await from_callback
 
     with TaskRunner() as runner:
-        token = runner.run(set_with_token())
-        runner.run(_set("from test"))
-        with _set_in_sync("from fixture"):
-            runner.run(reset(token))
-        assert runner.run(_get()) == "unset"
+        assert runner.run(job()) == ("in job", "in job")
 
 
-def test_setting_the_applied_value_again_is_not_a_change():
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Task.get_context() is new")
+def test_the_task_context_is_not_the_job_context():
     """
-    Whether a job changed a variable is known only from the value it left: a
-    set to the value the submitting context applied is restored like any
-    unchanged variable.
+    The known difference from a task of the job's own: the task's context is
+    not the job's, so passing it on explicitly passes on the wrong variables;
+    copy_context() and the default of create_task() and call_soon() are right.
     """
-    value = "shared"
+
+    async def job() -> tuple[str, str, str]:
+        _var.set("in job")
+        loop = asyncio.get_running_loop()
+        explicit = _task().get_context()
+        child = asyncio.create_task(_get(), context=explicit)
+        from_callback = loop.create_future()
+        loop.call_soon(
+            lambda: from_callback.set_result(_var.get("unset")), context=explicit
+        )
+        return await child, await from_callback, contextvars.copy_context()[_var]
+
     with TaskRunner() as runner:
-        with _set_in_sync(value):
-            runner.run(_set(value))
-        assert runner.run(_get()) == "unset"
+        assert runner.run(job()) == ("unset", "unset", "in job")
 
 
 @pytest.mark.parametrize("seen", ["idle", "escaping"])
-def test_cancellation_leaves_only_teardowns_until_the_loop_closes(seen: str):
+def test_a_cancellation_of_the_task_leaves_only_teardowns(seen: str):
     """
-    A cancellation reaching the task, between two jobs or escaping one, is
-    the end of the loop's normal work: only teardown jobs run from then on,
+    A cancellation of the task, landing on it between two jobs or escaping
+    one, ends the loop's normal work: only teardown jobs run from then on,
     for the requesting scope to exit; any other job is refused with a
-    CancelledError saying so, its coroutine closed unawaited. Resolving the
-    request, as the scope does on exit, changes nothing.
+    CancelledError saying so, its coroutine closed unawaited. The scope
+    resolving its request on exit changes nothing.
     """
 
     async def cancel_self() -> None:
@@ -220,14 +216,10 @@ def test_cancellation_leaves_only_teardowns_until_the_loop_closes(seen: str):
         else:
             with pytest.raises(asyncio.CancelledError):
                 runner.run(cancel_self())
-        refused = _never_started()
-        with pytest.raises(asyncio.CancelledError, match=_REFUSED):
-            runner.run(refused)
-        assert refused.cr_frame is None
+        _assert_teardown_only(runner)
         runner.run(resolve(), teardown=True)
         assert runner.run(_cancelling(), teardown=True) == 0
-        with pytest.raises(asyncio.CancelledError, match=_REFUSED):
-            runner.run(_nothing())
+        _assert_teardown_only(runner)
 
 
 def test_a_suppressed_cancellation_never_reaches_the_task():
@@ -243,23 +235,28 @@ def test_a_suppressed_cancellation_never_reaches_the_task():
         runner.run(_nothing())
 
 
-@_INTERRUPTION_CANCELS_ON_310
 @pytest.mark.parametrize("cleanup", ["propagate", "suppress", "fail"])
-def test_interrupted_job_is_cancelled_and_joined(cleanup: str):
+@pytest.mark.parametrize("suspended", ["at an await", "between steps"])
+def test_interrupted_job_is_cancelled_and_joined(suspended: str, cleanup: str):
     """
-    An interrupted job is cancelled and run until it has ended: its cleanup
-    completes before run() raises. A cleanup that fails is the job's outcome
-    (the cancellation its context); one that ends or suppresses the
-    cancellation does not suppress the interruption. The runner's request is
-    resolved, and the task goes on serving.
+    An interrupted job's task is cancelled, as asyncio.Runner cancels its
+    task, and the job runs until it has ended: its cleanup completes before
+    run() raises. A cleanup that fails is the job's outcome (the cancellation
+    its context); one that ends or suppresses the cancellation does not
+    suppress the interruption. The loop is teardown-only from then on.
     """
     log = []
 
     async def job() -> None:
         _interrupt(asyncio.get_running_loop())
         try:
-            await asyncio.Event().wait()
+            if suspended == "at an await":
+                await asyncio.Event().wait()
+            else:
+                await asyncio.sleep(0)
         except asyncio.CancelledError:
+            if sys.version_info >= (3, 11):
+                assert await _cancelling() == 1
             await asyncio.sleep(0)
             log.append("cleaned up")
             if cleanup == "propagate":
@@ -274,11 +271,94 @@ def test_interrupted_job_is_cancelled_and_joined(cleanup: str):
         assert log == ["cleaned up"]
         if cleanup == "fail":
             assert isinstance(info.value.__context__, asyncio.CancelledError)
-        assert runner.run(_cancelling(), teardown=True) == 0
-        runner.run(_nothing())
+        _assert_teardown_only(runner)
 
 
-@_INTERRUPTION_CANCELS_ON_310
+@_REQUIRES_311
+def test_interrupted_job_tells_its_cancellation_from_a_child_s():
+    """
+    The interruption is a cancellation request on the task, which a job
+    awaiting a child task can tell from the child's own cancellation.
+    """
+    log = []
+
+    async def job() -> None:
+        _interrupt(asyncio.get_running_loop())
+        try:
+            await asyncio.create_task(asyncio.Event().wait())
+        except asyncio.CancelledError:
+            if await _cancelling() == 0:
+                log.append("child cancelled; carrying on")
+                await asyncio.Event().wait()
+            raise
+        finally:
+            log.append("cleaned up")
+
+    with TaskRunner() as runner:
+        with pytest.raises(KeyboardInterrupt):
+            runner.run(job())
+        assert log == ["cleaned up"]
+
+
+def test_interrupted_job_awaiting_a_future_like_object():
+    """Whatever the job awaits, asyncio's own cancellation reaches it."""
+
+    class FutureLike:
+        """A Future-like object (asyncio.isfuture), not an asyncio.Future."""
+
+        _asyncio_future_blocking = False
+
+        def __init__(self) -> None:
+            self.inner = asyncio.get_running_loop().create_future()
+            self.cancelled_with: list[object] = []
+
+        def __await__(self):
+            if not self.inner.done():
+                self._asyncio_future_blocking = True
+                yield self
+            return self.inner.result()
+
+        def get_loop(self):
+            return self.inner.get_loop()
+
+        def add_done_callback(self, callback, *, context=None):
+            self.inner.add_done_callback(lambda _: callback(self), context=context)
+
+        def remove_done_callback(self, callback):
+            return 0
+
+        def cancel(self, msg=None):
+            self.cancelled_with.append(msg)
+            return self.inner.cancel(msg)
+
+        def done(self):
+            return self.inner.done()
+
+        def cancelled(self):
+            return self.inner.cancelled()
+
+        def result(self):
+            return self.inner.result()
+
+        def exception(self):
+            return self.inner.exception()
+
+    cancelled_with = []
+
+    async def job() -> None:
+        _interrupt(asyncio.get_running_loop())
+        future = FutureLike()
+        assert asyncio.isfuture(future)
+        try:
+            await future
+        finally:
+            cancelled_with.extend(future.cancelled_with)
+
+    with TaskRunner() as runner, pytest.raises(KeyboardInterrupt):
+        runner.run(job())
+    assert cancelled_with == [None]
+
+
 @pytest.mark.parametrize("then", ["propagate", "suppress", "fail"])
 def test_second_interruption_abandons_the_job(then: str):
     """
@@ -310,34 +390,22 @@ def test_second_interruption_abandons_the_job(then: str):
         with pytest.raises(KeyboardInterrupt):
             runner.run(job())
         assert log == []
-        runner.run(_nothing())
+        runner.run(_nothing(), teardown=True)
         assert log == ["ended"]
-        assert runner.run(_cancelling(), teardown=True) == 0
     failures = [type(context["exception"]) for context in reported]
     assert failures == ([ValueError] if then == "fail" else [])
 
 
-def test_interruption_does_not_hide_a_cancellation_requested_meanwhile():
-    """
-    While the interrupted job cleans up, a scope of the user's may cancel
-    the task too (a task group whose child failed, say). Resolving the
-    runner's own request leaves that one: the task counts as cancelled.
-    """
+def test_interruption_after_the_job_ended_is_only_the_interruption():
+    """A job that ended before the wait for it was interrupted is left alone."""
 
     async def job() -> None:
         _interrupt(asyncio.get_running_loop())
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            _task().cancel()
-            await asyncio.Event().wait()
 
     with TaskRunner() as runner:
         with pytest.raises(KeyboardInterrupt):
             runner.run(job())
-        with pytest.raises(asyncio.CancelledError, match=_REFUSED):
-            runner.run(_nothing())
-        runner.run(_nothing(), teardown=True)
+        assert runner.run(_cancelling()) == 0
 
 
 def test_interruption_before_the_job_started_skips_the_job():
@@ -372,37 +440,41 @@ def test_task_cancelled_before_its_first_step_fails_the_job():
 
     with (
         TaskRunner(loop_factory=loop_factory) as runner,
-        pytest.raises(RuntimeError, match="has died") as info,
+        pytest.raises(asyncio.CancelledError) as info,
     ):
         runner.run(_never_started())
-    assert isinstance(info.value.__cause__, asyncio.CancelledError)
+    if sys.version_info >= (3, 11):
+        assert any("died" in note for note in info.value.__notes__)
 
 
 class _Failed(BaseException):
     """A BaseException asyncio keeps inside the loop (pytest-timeout's, say)."""
 
 
-@pytest.mark.parametrize("error_type", [SystemExit, _Failed])
-def test_task_dying_fails_every_job(
+@pytest.mark.parametrize(
+    "error_type", [KeyboardInterrupt, SystemExit, _Failed, ValueError]
+)
+def test_task_dying_raises_its_exception_for_every_job(
     monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
 ):
     """
-    A BaseException raised in the task's own frames, outside any job (by a
-    signal handler, say), kills the task, whether asyncio lets it escape the
-    loop (SystemExit here, standing in for KeyboardInterrupt) or keeps it in
-    the task. The job and every later one fail with a RuntimeError carrying
-    it as cause, their coroutines closed unawaited; the loop closes cleanly.
+    An exception raised in the task's own frames, outside any job, kills the
+    task. The job's run() and every later one raise that exception as it is,
+    so that pytest treats it as it would from a synchronous test (a
+    KeyboardInterrupt stops the session, a SystemExit is a failure). The
+    coroutines are closed unawaited, and the loop closes cleanly.
     """
 
-    def die(self: TaskRunner, job: object, *, cancelled: bool) -> None:
+    def die(self: object, result: object) -> None:
         raise error_type("task killed")
 
-    monkeypatch.setattr(TaskRunner, "_settle", die)
+    monkeypatch.setattr(pytest_asyncio._runner._Job, "succeed", die)
     with TaskRunner() as runner:
         for coro in (_nothing(), _never_started()):
-            with pytest.raises(RuntimeError, match="has died") as info:
+            with pytest.raises(error_type, match="task killed") as info:
                 runner.run(coro)
-            assert isinstance(info.value.__cause__, error_type)
+            if sys.version_info >= (3, 11):
+                assert sum("died" in note for note in info.value.__notes__) == 1
 
 
 def test_close_finalises_an_unresumed_async_generator():

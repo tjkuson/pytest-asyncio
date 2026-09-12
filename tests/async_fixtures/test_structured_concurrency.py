@@ -27,16 +27,22 @@ _REQUIRES_UVLOOP = pytest.mark.skipif(
 )
 _LIBRARIES = [pytest.param("asyncio", marks=_REQUIRES_311), "anyio"]
 
-# A cancelled setup or test raises the CancelledError itself, explained by a
-# note on 3.11+; a cancelled teardown is an Exception, so pytest goes on.
+# A cancelled test raises the CancelledError itself, explained by a note on
+# 3.11+. A cancelled fixture setup or teardown is an Exception caused by it, so
+# that pytest goes on: with the fixture's other users, or the node's finalizers.
 _CANCELLED = ["*asyncio.exceptions.CancelledError*"]
 if sys.version_info >= (3, 11):
     _CANCELLED.append("*The task running pytest-asyncio's fixtures and tests on *")
 _REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed.*"
-_TEARDOWN_CANCELLED = (
-    "*PytestAsyncioError: The teardown of the async generator fixture was "
-    "cancelled.*"
-)
+
+
+def _fixture_cancelled(phase: str) -> list[str]:
+    """The error of a cancelled fixture phase, printed after its cause."""
+    return [
+        "*asyncio.exceptions.CancelledError*",
+        "*direct cause of the following*",
+        f"*PytestAsyncioError: The {phase} of the async fixture was cancelled.*",
+    ]
 
 
 def _task_group(library: str, *children: str) -> tuple[str, str]:
@@ -161,7 +167,11 @@ def test_child_failing_cancels_the_running_phase(
         lines = [*teardown, "*_ test_service _*", *_CANCELLED]
     else:
         result.assert_outcomes(errors=2)
-        lines = ["*ERROR at setup of test_service*", *_CANCELLED, *teardown]
+        lines = [
+            "*ERROR at setup of test_service*",
+            *_fixture_cancelled("setup"),
+            *teardown,
+        ]
     result.stdout.fnmatch_lines(lines)
     assert "SIBLING CANCELLED" in result.stdout.str()
 
@@ -303,7 +313,7 @@ def test_dependent_teardown_inside_cancelled_scope(
     # Both teardown errors are in one exception group, in pytest's order.
     result.stdout.fnmatch_lines(["*RuntimeError: connection worker failed*"])
     if cleanup_cancelled:
-        result.stdout.fnmatch_lines([_TEARDOWN_CANCELLED])
+        result.stdout.fnmatch_lines(_fixture_cancelled("teardown"))
 
 
 @pytest.mark.parametrize("library", _LIBRARIES)
@@ -620,9 +630,7 @@ def test_repeated_cancellation_preserves_cleanup_error(pytester: Pytester):
     result.stdout.fnmatch_lines(
         ["*PARENT CLEANUP RAN*", "*RuntimeError: parent cleanup failed*"]
     )
-    result.stdout.fnmatch_lines(
-        ["*CancelledError*", "*direct cause of the following*", _TEARDOWN_CANCELLED]
-    )
+    result.stdout.fnmatch_lines(_fixture_cancelled("teardown"))
     assert "CHILD CLEANUP RAN" not in result.stdout.str()
 
 

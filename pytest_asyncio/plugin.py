@@ -333,21 +333,43 @@ fixture requested the cancellation, the error that caused it is reported when \
 that fixture is torn down.\
 """
 
-_TEARDOWN_CANCELLED_MESSAGE = """\
-The teardown of the async generator fixture was cancelled. \
-""" + _CANCELLED_NOTE
-
 _T = TypeVar("_T")
 
 
-def _run(runner: TaskRunner, coro: AbstractCoroutine[Any, Any, _T]) -> _T:
-    """Run a fixture setup or test coroutine, explaining a cancellation."""
+def _run_test(
+    runner: TaskRunner,
+    coro: AbstractCoroutine[Any, Any, _T],
+    context: contextvars.Context,
+) -> _T:
+    """Run a test coroutine, explaining a cancellation."""
     try:
-        return runner.run(coro)
+        return runner.run(coro, context=context)
     except asyncio.CancelledError as exc:
         if sys.version_info >= (3, 11):
             exc.add_note(_CANCELLED_NOTE)
         raise
+
+
+def _run_fixture_phase(
+    runner: TaskRunner,
+    coro: AbstractCoroutine[Any, Any, _T],
+    context: contextvars.Context,
+    *,
+    teardown: bool = False,
+) -> _T:
+    """
+    Run the setup or teardown coroutine of an async fixture.
+
+    A cancellation is reported as an Exception: pytest caches the error of a
+    fixture's setup for the fixture's other users, and carries on with the
+    remaining finalizers of a node after a failed teardown, only for one.
+    """
+    try:
+        return runner.run(coro, context=context, teardown=teardown)
+    except asyncio.CancelledError as exc:
+        phase = "teardown" if teardown else "setup"
+        msg = f"The {phase} of the async fixture was cancelled. " + _CANCELLED_NOTE
+        raise PytestAsyncioError(msg) from exc
 
 
 def _fixture_synchronizer(
@@ -423,16 +445,13 @@ def _wrap_asyncgen_fixture(
     ):
         gen_obj = fixture_function(*args, **kwargs)
 
-        async def setup() -> (
-            tuple[AsyncGenFixtureYieldType, contextvars.Context, contextvars.Context]
-        ):
-            before = contextvars.copy_context()
-            res = await gen_obj.__anext__()
-            return res, before, contextvars.copy_context()
+        async def setup() -> AsyncGenFixtureYieldType:
+            return await gen_obj.__anext__()
 
-        result, before, after = _run(runner, setup())
+        context = contextvars.copy_context()
+        result = _run_fixture_phase(runner, setup(), context)
 
-        reset_contextvars = _apply_contextvar_changes(before, after)
+        reset_contextvars = _apply_contextvar_changes(context)
 
         def finalizer() -> None:
             """Yield again, to finalize."""
@@ -448,11 +467,7 @@ def _wrap_asyncgen_fixture(
                     raise ValueError(msg)
 
             try:
-                runner.run(async_finalizer(), teardown=True)
-            except asyncio.CancelledError as exc:
-                # pytest carries on with a node's remaining finalizers only
-                # after an Exception; a CancelledError would end them.
-                raise PytestAsyncioError(_TEARDOWN_CANCELLED_MESSAGE) from exc
+                _run_fixture_phase(runner, async_finalizer(), context, teardown=True)
             finally:
                 if reset_contextvars is not None:
                     reset_contextvars()
@@ -479,14 +494,11 @@ def _wrap_async_fixture(
         *args: AsyncFixtureParams.args,
         **kwargs: AsyncFixtureParams.kwargs,
     ):
-        async def setup() -> (
-            tuple[AsyncFixtureReturnType, contextvars.Context, contextvars.Context]
-        ):
-            before = contextvars.copy_context()
-            res = await fixture_function(*args, **kwargs)
-            return res, before, contextvars.copy_context()
+        async def setup() -> AsyncFixtureReturnType:
+            return await fixture_function(*args, **kwargs)
 
-        result, before, after = _run(runner, setup())
+        context = contextvars.copy_context()
+        result = _run_fixture_phase(runner, setup(), context)
 
         # Copy the context vars modified by the fixture into the current
         # context, and (if needed) add a finalizer to reset them.
@@ -496,7 +508,7 @@ def _wrap_async_fixture(
         # to reset the variables. In this case, the author of the fixture can't
         # write such a finalizer because they have no way to capture the Context
         # in which the setup function was run, so we need to do it for them.
-        reset_contextvars = _apply_contextvar_changes(before, after)
+        reset_contextvars = _apply_contextvar_changes(context)
         if reset_contextvars is not None:
             request.addfinalizer(reset_contextvars)
 
@@ -506,21 +518,24 @@ def _wrap_async_fixture(
 
 
 def _apply_contextvar_changes(
-    before: contextvars.Context, after: contextvars.Context
+    context: contextvars.Context,
 ) -> Callable[[], None] | None:
     """
-    Copy the contextvars a fixture changed into the current context.
+    Copy contextvar changes from the given context to the current context.
 
-    ``before`` and ``after`` are copies of the fixture's context taken around
-    its setup. If any contextvars were modified by the fixture, return a
-    finalizer that will restore them.
+    If any contextvars were modified by the fixture, return a finalizer that
+    will restore them.
     """
     context_tokens = []
-    for var, value in after.items():
-        if var in before and before[var] is value:
-            # This variable is not modified, so leave it as-is.
-            continue
-        token = var.set(value)
+    for var in context:
+        try:
+            if var.get() is context.get(var):
+                # This variable is not modified, so leave it as-is.
+                continue
+        except LookupError:
+            # This variable isn't yet set in the current context at all.
+            pass
+        token = var.set(context.get(var))
         context_tokens.append((var, token))
 
     if not context_tokens:
@@ -591,8 +606,9 @@ class PytestAsyncioFunction(Function):
     def runtest(self) -> None:
         runner_fixture_id = f"_{self._loop_scope}_scoped_runner"
         runner = self._request.getfixturevalue(runner_fixture_id)
+        context = contextvars.copy_context()
         synchronized_obj = _synchronize_coroutine(
-            getattr(*self._synchronization_target_attr), runner
+            getattr(*self._synchronization_target_attr), runner, context
         )
         with MonkeyPatch.context() as c:
             c.setattr(*self._synchronization_target_attr, synchronized_obj)
@@ -922,15 +938,16 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
 def _synchronize_coroutine(
     func: Callable[..., CoroutineType],
     runner: TaskRunner,
+    context: contextvars.Context,
 ):
     """
     Return a sync wrapper around a coroutine executing it in the
-    specified runner.
+    specified runner and context.
     """
 
     @functools.wraps(func)
     def inner(*args, **kwargs):
-        _run(runner, func(*args, **kwargs))
+        _run_test(runner, func(*args, **kwargs), context)
 
     return inner
 
