@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
+from textwrap import dedent
 
 import pytest
-from pytest_asyncio.plugin import PytestAsyncioError, _opened_runner
+from pytest import Pytester
+from pytest_asyncio._runner import TaskRunner
+from pytest_asyncio.plugin import PytestAsyncioError, _opened
 
 _REQUIRES_311 = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
@@ -41,8 +45,8 @@ def test_the_runner_closes_however_its_scope_ends(exit_with):
     """A normal end, an interruption or a closed generator: the loop closes."""
     loop_factory, loops = _loop_factory()
     with (
-        pytest.raises(exit_with) if exit_with else _no_error(),
-        _opened_runner(None, loop_factory) as runner,
+        pytest.raises(exit_with) if exit_with else contextlib.nullcontext(),
+        _opened(TaskRunner(loop_factory=loop_factory)) as runner,
     ):
         assert runner.get_loop() is loops[0]
         if exit_with:
@@ -55,15 +59,43 @@ def test_a_failed_opening_is_a_fixture_error_and_opens_nothing():
     loop_factory, loops = _loop_factory(lambda loop, task: task.cancel())
     with (
         pytest.raises(PytestAsyncioError, match="could not open this event loop"),
-        _opened_runner(None, loop_factory),
+        _opened(TaskRunner(loop_factory=loop_factory)),
     ):
         pytest.fail("the runner opened")
     assert loops[0].is_closed()
 
 
-class _no_error:
-    def __enter__(self):
-        return self
+def test_the_loop_is_current_until_the_runner_has_closed(pytester: Pytester):
+    """A loop from a loop factory is the current loop through the runner's close."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent("""\
+            import asyncio
 
-    def __exit__(self, *exc_info):
-        return False
+            closed_while_current = []
+
+            class Loop(asyncio.SelectorEventLoop):
+                def close(self):
+                    if not self.is_closed():
+                        try:
+                            current = asyncio.get_event_loop()
+                        except RuntimeError:
+                            current = None
+                        closed_while_current.append(current is self)
+                    super().close()
+
+            def pytest_asyncio_loop_factories(config, item):
+                return {"custom": Loop}
+            """))
+    pytester.makepyfile(dedent("""\
+            import pytest
+            from conftest import closed_while_current
+
+            @pytest.mark.asyncio
+            async def test_uses_the_loop():
+                pass
+
+            def test_the_loop_was_current_while_it_closed():
+                assert closed_while_current == [True]
+            """))
+    result = pytester.runpytest("--asyncio-mode=strict", "-W", "error")
+    result.assert_outcomes(passed=2)

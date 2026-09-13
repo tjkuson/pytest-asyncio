@@ -342,11 +342,11 @@ def _run_test(
     context: contextvars.Context,
     name: str,
 ) -> _T:
-    """Run a test coroutine, explaining a cancellation."""
+    """Run a test coroutine, explaining a cancellation that ended the loop's work."""
     try:
         return runner.run(coro, context=context, name=name)
     except asyncio.CancelledError as exc:
-        if sys.version_info >= (3, 11):
+        if runner.teardown_only and sys.version_info >= (3, 11):
             exc.add_note(_CANCELLED_NOTE)
         raise
 
@@ -357,7 +357,7 @@ _OPENING_CANCELLED_MESSAGE = (
 )
 
 
-def _cancelled_fixture_error(phase: str) -> PytestAsyncioError:
+def _cancelled_fixture_error(phase: str, runner: TaskRunner) -> PytestAsyncioError:
     """
     The error reported for a cancelled setup or teardown of an async fixture.
 
@@ -365,7 +365,9 @@ def _cancelled_fixture_error(phase: str) -> PytestAsyncioError:
     fixture's setup for the fixture's other users, and carries on with the
     remaining finalizers of a node after a failed teardown, only for one.
     """
-    msg = f"The {phase} of the async fixture was cancelled. " + _CANCELLED_NOTE
+    msg = f"The {phase} of the async fixture was cancelled."
+    if runner.teardown_only:
+        msg += " " + _CANCELLED_NOTE
     return PytestAsyncioError(msg)
 
 
@@ -448,7 +450,7 @@ def _wrap_asyncgen_fixture(
                 gen_obj, context=context, name=request.fixturename
             )
         except asyncio.CancelledError as exc:
-            raise _cancelled_fixture_error("setup") from exc
+            raise _cancelled_fixture_error("setup", runner) from exc
 
         assert fixture.context_after is not None
         reset_contextvars = _apply_contextvar_changes(context, fixture.context_after)
@@ -458,7 +460,7 @@ def _wrap_asyncgen_fixture(
             try:
                 runner.finish_fixture(fixture)
             except asyncio.CancelledError as exc:
-                raise _cancelled_fixture_error("teardown") from exc
+                raise _cancelled_fixture_error("teardown", runner) from exc
             finally:
                 if reset_contextvars is not None:
                     reset_contextvars()
@@ -495,7 +497,7 @@ def _wrap_async_fixture(
                 setup(), context=context, name=request.fixturename
             )
         except asyncio.CancelledError as exc:
-            raise _cancelled_fixture_error("setup") from exc
+            raise _cancelled_fixture_error("setup", runner) from exc
 
         # Copy the context vars modified by the fixture into the current
         # context, and (if needed) add a finalizer to reset them.
@@ -1061,18 +1063,15 @@ Here is the traceback of the exception triggered during teardown:
 
 
 @contextlib.contextmanager
-def _opened_runner(
-    debug: bool | None, loop_factory: Callable[[], AbstractEventLoop] | None
-) -> Iterator[TaskRunner]:
+def _opened(runner: TaskRunner) -> Iterator[TaskRunner]:
     """
-    The runner of a loop scope, open.
+    The runner, open.
 
     A failed opening is an ordinary fixture error, which pytest reports for
     every test of the scope. An error closing the runner, most likely
     because a test closed the loop, is reported as a warning (see
     _RUNNER_TEARDOWN_WARNING).
     """
-    runner = TaskRunner(debug=debug, loop_factory=loop_factory)
     try:
         runner.open()
     except asyncio.CancelledError as exc:
@@ -1095,7 +1094,7 @@ def _opened_runner(
 
 @contextlib.contextmanager
 def _as_current_event_loop(runner: TaskRunner) -> Iterator[None]:
-    """The runner's loop is the thread's current event loop while it is open."""
+    """The runner's loop is the thread's current event loop."""
     _set_event_loop(runner.get_loop())
     try:
         yield
@@ -1113,16 +1112,18 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
         _asyncio_loop_factory,
         request: FixtureRequest,
     ) -> Iterator[TaskRunner]:
-        debug_mode = _get_asyncio_debug(request.config)
+        runner = TaskRunner(
+            debug=_get_asyncio_debug(request.config),
+            loop_factory=_asyncio_loop_factory,
+        )
         with _temporary_event_loop_policy(event_loop_policy):
             if _asyncio_loop_factory is None:
-                with _opened_runner(debug_mode, None) as runner:
+                with _opened(runner):
                     yield runner
             else:
-                # The loop is reset after the runner has closed.
-                with _opened_runner(debug_mode, _asyncio_loop_factory) as runner:
-                    with _as_current_event_loop(runner):
-                        yield runner
+                # The loop is current until the runner has closed.
+                with _as_current_event_loop(runner), _opened(runner):
+                    yield runner
 
     return _scoped_runner
 

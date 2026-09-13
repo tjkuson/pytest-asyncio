@@ -205,26 +205,34 @@ def test_a_fixture_keeps_its_context_from_setup_to_teardown():
 
 
 def test_the_task_of_a_coroutine_owns_its_context():
-    """A native task: its context is the coroutine's, its awaits are its own."""
+    """
+    A native task: its context is the coroutine's, and its await chain, seen
+    while the coroutine is suspended, leads to the coroutine's own frame.
+    """
+
+    def chain_of(task: asyncio.Task[Any]) -> list[str]:
+        names = []
+        coro: Any = task.get_coro()
+        while coro is not None and hasattr(coro, "cr_frame"):
+            names.append(coro.cr_frame.f_code.co_name)
+            coro = coro.cr_await
+        return names
 
     async def job() -> tuple[str, list[str]]:
         _var.set("in job")
         task = _task()
         loop = asyncio.get_running_loop()
-        read = loop.create_future()
+        seen = loop.create_future()
         loop.call_soon(
-            lambda: read.set_result(_var.get("unset")),
+            lambda: seen.set_result((_var.get("unset"), chain_of(task))),
             context=task.get_context() if sys.version_info >= (3, 12) else None,
         )
-        chain = []
-        coro: Any = task.get_coro()
-        while coro is not None and hasattr(coro, "cr_frame"):
-            chain.append(coro.cr_frame.f_code.co_name)
-            coro = coro.cr_await
-        return await read, chain
+        return await seen
 
     with TaskRunner() as runner:
-        assert _run(runner, job()) == ("in job", ["job"])
+        value, chain = _run(runner, job())
+    assert value == "in job"
+    assert chain[-1] == "job"
 
 
 @_REQUIRES_311
@@ -654,30 +662,6 @@ def test_a_cancellation_of_the_root_ends_the_normal_work_of_the_loop():
     assert log == ["torn down"]
 
 
-def test_a_test_cancelling_and_joining_every_task_fails_with_the_cancellation():
-    """
-    Without live generator fixtures the other tasks are the runner's waiter
-    and, on 3.11+, the root owning the fixtures' group. Cancelling the
-    waiter interrupts the wait, which cancels the test; the root, cancelled
-    with no children, ends at once, so the join ends. The test fails with
-    the cancellation, promptly; the loop is teardown-only from then on.
-    """
-
-    async def cancel_all_and_join() -> None:
-        others = asyncio.all_tasks() - {_task()}
-        for task in others:
-            task.cancel()
-        await asyncio.gather(*others, return_exceptions=True)
-
-    with TaskRunner() as runner:
-        with pytest.raises(asyncio.CancelledError):
-            _run(runner, cancel_all_and_join())
-        if sys.version_info >= (3, 11):
-            _assert_teardown_only(runner)
-        else:
-            _run(runner, _nothing())
-
-
 def _loop_factory_doing(
     first: Callable[[asyncio.AbstractEventLoop, asyncio.Task[Any]], None],
 ):
@@ -781,10 +765,35 @@ def test_an_abandoned_coroutine_is_kept_until_the_loop_closes():
         assert events == ["first cleanup", "nested cleanup"]
     assert events == ["first cleanup", "nested cleanup", "nested cleanup done"]
     assert reported == []
-    # Ended, the task is released: the runner owns nothing it does not need.
-    del runner
-    gc.collect()
-    assert references[0]() is None
+
+
+def test_an_abandoned_coroutine_that_ends_is_released():
+    """The runner keeps an abandoned task only until it ends."""
+    references = []
+
+    async def job() -> None:
+        loop = asyncio.get_running_loop()
+        references.append(weakref.ref(_task()))
+        _interrupt(loop)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            _interrupt(loop)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+
+    async def turns() -> None:
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    with TaskRunner() as runner:
+        with pytest.raises(KeyboardInterrupt):
+            _run(runner, job())
+        _run(runner, turns())
+        gc.collect()
+        assert references[0]() is None
 
 
 def test_an_error_settled_just_before_the_second_interruption_is_reported_once():

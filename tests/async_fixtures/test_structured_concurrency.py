@@ -99,8 +99,22 @@ def test_one_task_per_fixture_and_test(pytester: Pytester):
         @pytest.mark.asyncio(loop_scope="module")
         async def test_plain(coroutine):
             record("test_plain")
-            # The task runs the test's own coroutine.
-            assert asyncio.current_task().get_coro().cr_frame is sys._getframe()
+            # The test's own frame is in the task's await chain, seen while
+            # the test is suspended.
+            task = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            seen = loop.create_future()
+
+            def frames():
+                chain = []
+                coro = task.get_coro()
+                while coro is not None and hasattr(coro, "cr_frame"):
+                    chain.append(coro.cr_frame)
+                    coro = coro.cr_await
+                seen.set_result(chain)
+
+            loop.call_soon(frames)
+            assert sys._getframe() in await seen
 
         @pytest.mark.asyncio(loop_scope="module")
         @settings(max_examples=3, deadline=None, database=None)

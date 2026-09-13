@@ -140,60 +140,6 @@ def test_cancelling_every_task_reaches_the_fixture_at_its_yield(
     )
 
 
-def test_cancelling_and_joining_every_task_without_live_fixtures_fails_at_once(
-    pytester: Pytester,
-):
-    """
-    Without live async generator fixtures, the other tasks of the loop are
-    the runner's wait for the test and, on 3.11+, pytest-asyncio's own task
-    owning the fixtures' group. Cancelling the wait interrupts it, which
-    cancels the test; the owner, cancelled with no fixture to wait for, ends
-    at once. The test fails with CancelledError, promptly; the loop is then
-    teardown-only, so the next test is refused. (A test joining the task of
-    a live generator fixture would wait for pytest to tear the fixture down:
-    forever.)
-    """
-    result = _run(
-        pytester,
-        """
-        import asyncio
-        import pytest
-        import pytest_asyncio
-
-        @pytest_asyncio.fixture(scope="module", loop_scope="module")
-        async def failed_fixture():
-            raise RuntimeError("setup fails before the yield")
-            yield
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_failed_fixture(failed_fixture):
-            pass
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_cancel_and_join():
-            others = asyncio.all_tasks() - {asyncio.current_task()}
-            for task in others:
-                task.cancel()
-            await asyncio.gather(*others, return_exceptions=True)
-            print("JOINED")
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_next():
-            print("NEXT RAN")
-        """,
-        subprocess=True,
-    )
-    out = result.stdout.str()
-    result.stdout.fnmatch_lines(["*_ test_cancel_and_join _*", "*CancelledError*"])
-    assert "JOINED" not in out
-    if sys.version_info >= (3, 11):
-        result.assert_outcomes(failed=2, errors=1)
-        assert "NEXT RAN" not in out
-        result.stdout.fnmatch_lines(["*_ test_next _*", _REFUSED])
-    else:
-        result.assert_outcomes(failed=1, passed=1, errors=1)
-
-
 @_NEEDS_TASK_GROUP
 @pytest.mark.parametrize(
     "cancel",

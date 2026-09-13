@@ -109,14 +109,14 @@ This sequential execution is intentional and important for maintaining test isol
 Tasks, cancellation and context
 ===============================
 
-pytest-asyncio runs each async fixture and each test in an asyncio task of its own, named after the fixture or test.
+pytest-asyncio runs each async fixture and each test in an asyncio task of its own.
 The task of an async generator fixture stays alive across the fixture's ``yield``: it runs the setup, waits while the fixture is in use, and runs the teardown.
 The task that enters a task group, cancel scope or timeout before the ``yield`` is therefore the task that exits it, so a fixture can wrap its ``yield`` in an ``asyncio.TaskGroup``, an ``asyncio.timeout``, or the cancel scope of a library such as AnyIO, and background tasks run for as long as the fixture is alive:
 
 .. include:: concepts_task_group_fixture_example.py
     :code: python
 
-A fixture's errors go to pytest, at the setup or teardown of that fixture, so one fixture's failure does not cancel the others.
+A fixture's errors go to pytest, at the setup or teardown of that fixture, and pytest tears fixtures down in its usual order.
 
 pytest-asyncio manages internal tasks that may appear in ``asyncio.all_tasks()``.
 These tasks are not part of pytest-asyncio's public API, and their names, number and arrangement may change between releases.
