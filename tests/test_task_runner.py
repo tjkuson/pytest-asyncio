@@ -707,8 +707,8 @@ def _loop_factory_doing(
 def test_a_root_cancelled_before_it_entered_fails_the_opening_of_the_runner():
     """The loop's task factory cancels the first task, which is the root."""
     loop_factory, loops = _loop_factory_doing(lambda loop, task: task.cancel())
-    with pytest.raises(asyncio.CancelledError):
-        TaskRunner(loop_factory=loop_factory).__enter__()
+    with pytest.raises(asyncio.CancelledError), TaskRunner(loop_factory=loop_factory):
+        pytest.fail("the runner opened")
     (loop,) = loops
     assert loop.is_closed()
 
@@ -728,10 +728,15 @@ def test_a_root_cancelled_right_after_it_entered_makes_the_loop_teardown_only():
 @_REQUIRES_311
 def test_an_interruption_while_the_runner_opens_releases_the_loop():
     """A callback queued on the new loop raises before the root's first step."""
-    loop_factory, loops = _loop_factory_doing(lambda loop, task: _interrupt(loop))
     reported = []
-    with pytest.raises(KeyboardInterrupt):
-        TaskRunner(loop_factory=loop_factory).__enter__()
+
+    def interrupt(loop: asyncio.AbstractEventLoop, task: asyncio.Task[Any]) -> None:
+        loop.set_exception_handler(lambda loop, ctx: reported.append(ctx))
+        _interrupt(loop)
+
+    loop_factory, loops = _loop_factory_doing(interrupt)
+    with pytest.raises(KeyboardInterrupt), TaskRunner(loop_factory=loop_factory):
+        pytest.fail("the runner opened")
     (loop,) = loops
     assert loop.is_closed()
     gc.collect()
@@ -776,6 +781,10 @@ def test_an_abandoned_coroutine_is_kept_until_the_loop_closes():
         assert events == ["first cleanup", "nested cleanup"]
     assert events == ["first cleanup", "nested cleanup", "nested cleanup done"]
     assert reported == []
+    # Ended, the task is released: the runner owns nothing it does not need.
+    del runner
+    gc.collect()
+    assert references[0]() is None
 
 
 def test_an_error_settled_just_before_the_second_interruption_is_reported_once():
@@ -825,12 +834,10 @@ def test_a_failure_escaping_a_fixture_task_ends_normal_work_and_is_raised_at_clo
         raise RuntimeError("a bug in the runner")
 
     monkeypatch.setattr(FixtureTask, "live", buggy)
-    runner = TaskRunner().__enter__()
-    loop = runner.get_loop()
-    with pytest.raises(RuntimeError, match="a bug in the runner"):
-        _start(runner, _plain_fixture())
-    _assert_teardown_only(runner)
-    with pytest.raises(_BaseExceptionGroup) as info:
-        runner.close()
+    with pytest.raises(_BaseExceptionGroup) as info, TaskRunner() as runner:
+        loop = runner.get_loop()
+        with pytest.raises(RuntimeError, match="a bug in the runner"):
+            _start(runner, _plain_fixture())
+        _assert_teardown_only(runner)
     assert [str(exc) for exc in info.value.exceptions] == ["a bug in the runner"]
     assert loop.is_closed()

@@ -272,7 +272,7 @@ def test_loop_whose_task_factory_cancels_the_first_task(
     if cancel == "task.cancel()":
         result.assert_outcomes(errors=2)
         result.stdout.fnmatch_lines(
-            ["*PytestAsyncioError: pytest-asyncio's task on this event loop was *"]
+            ["*PytestAsyncioError: pytest-asyncio could not open this event loop: *"]
         )
     else:
         result.assert_outcomes(errors=1, failed=1)

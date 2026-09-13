@@ -327,10 +327,10 @@ def pytest_report_header(config: Config) -> list[str]:
 
 
 _CANCELLED_NOTE = """\
-The task running pytest-asyncio's fixtures and tests on this event loop was \
-cancelled. If a task group, cancel scope or timeout spanning the yield of a \
-fixture requested the cancellation, the error that caused it is reported when \
-that fixture is torn down.\
+A task of pytest-asyncio's on this event loop was cancelled: only fixture \
+teardowns run on it until it closes. If a task group, cancel scope or timeout \
+spanning the yield of a fixture requested the cancellation, the error that \
+caused it is reported when that fixture is torn down.\
 """
 
 _T = TypeVar("_T")
@@ -352,8 +352,8 @@ def _run_test(
 
 
 _OPENING_CANCELLED_MESSAGE = (
-    "pytest-asyncio's task on this event loop was cancelled before it started "
-    "(by a task factory of the loop?), so the loop cannot run async fixtures."
+    "pytest-asyncio could not open this event loop: its task on the loop was "
+    "cancelled before it started. No async fixture or test runs on the loop."
 )
 
 
@@ -1060,6 +1060,49 @@ Here is the traceback of the exception triggered during teardown:
 """
 
 
+@contextlib.contextmanager
+def _opened_runner(
+    debug: bool | None, loop_factory: Callable[[], AbstractEventLoop] | None
+) -> Iterator[TaskRunner]:
+    """
+    The runner of a loop scope, open.
+
+    A failed opening is an ordinary fixture error, which pytest reports for
+    every test of the scope. An error closing the runner, most likely
+    because a test closed the loop, is reported as a warning (see
+    _RUNNER_TEARDOWN_WARNING).
+    """
+    runner = TaskRunner(debug=debug, loop_factory=loop_factory)
+    try:
+        runner.open()
+    except asyncio.CancelledError as exc:
+        raise PytestAsyncioError(_OPENING_CANCELLED_MESSAGE) from exc
+    try:
+        yield runner
+    finally:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", ".*BaseEventLoop.shutdown_asyncgens.*", RuntimeWarning
+            )
+            try:
+                runner.close()
+            except RuntimeError:
+                warnings.warn(
+                    _RUNNER_TEARDOWN_WARNING % traceback.format_exc(),
+                    RuntimeWarning,
+                )
+
+
+@contextlib.contextmanager
+def _as_current_event_loop(runner: TaskRunner) -> Iterator[None]:
+    """The runner's loop is the thread's current event loop while it is open."""
+    _set_event_loop(runner.get_loop())
+    try:
+        yield
+    finally:
+        _set_event_loop(None)
+
+
 def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
     @pytest.fixture(
         scope=scope,
@@ -1070,37 +1113,16 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
         _asyncio_loop_factory,
         request: FixtureRequest,
     ) -> Iterator[TaskRunner]:
-        new_loop_policy = event_loop_policy
         debug_mode = _get_asyncio_debug(request.config)
-        with _temporary_event_loop_policy(new_loop_policy):
-            try:
-                runner = TaskRunner(
-                    debug=debug_mode,
-                    loop_factory=_asyncio_loop_factory,
-                ).__enter__()
-            except asyncio.CancelledError as exc:
-                raise PytestAsyncioError(_OPENING_CANCELLED_MESSAGE) from exc
-            if _asyncio_loop_factory is not None:
-                _set_event_loop(runner.get_loop())
-            try:
-                yield runner
-            except Exception as e:
-                runner.__exit__(type(e), e, e.__traceback__)
+        with _temporary_event_loop_policy(event_loop_policy):
+            if _asyncio_loop_factory is None:
+                with _opened_runner(debug_mode, None) as runner:
+                    yield runner
             else:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore", ".*BaseEventLoop.shutdown_asyncgens.*", RuntimeWarning
-                    )
-                    try:
-                        runner.__exit__(None, None, None)
-                    except RuntimeError:
-                        warnings.warn(
-                            _RUNNER_TEARDOWN_WARNING % traceback.format_exc(),
-                            RuntimeWarning,
-                        )
-            finally:
-                if _asyncio_loop_factory is not None:
-                    _set_event_loop(None)
+                # The loop is reset after the runner has closed.
+                with _opened_runner(debug_mode, _asyncio_loop_factory) as runner:
+                    with _as_current_event_loop(runner):
+                        yield runner
 
     return _scoped_runner
 

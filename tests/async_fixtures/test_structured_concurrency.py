@@ -33,7 +33,7 @@ _LIBRARIES = [pytest.param("asyncio", marks=_REQUIRES_311), "anyio"]
 # that pytest goes on: with the fixture's other users, or the node's finalizers.
 _CANCELLED = ["*asyncio.exceptions.CancelledError*"]
 if sys.version_info >= (3, 11):
-    _CANCELLED.append("*The task running pytest-asyncio's fixtures and tests on *")
+    _CANCELLED.append("*A task of pytest-asyncio's on this event loop was cancelled: *")
 _REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed.*"
 
 
