@@ -479,6 +479,62 @@ def test_interruption_during_async_fixture_teardown(pytester: Pytester, interrup
     assert "Task was destroyed" not in out + result.stderr.str()
 
 
+def test_error_of_a_teardown_settled_just_before_its_abandonment_is_reported(
+    pytester: Pytester,
+):
+    """
+    The teardown, cancelled by a first interruption, ends with an error in
+    the same loop iteration as a second interruption of the wait for it.
+    The interruption ends the session; the error is reported through the
+    loop's exception handler, once, like an error after the abandonment.
+    """
+    result = _run(
+        pytester,
+        """
+        import asyncio
+        import pytest
+        import pytest_asyncio
+
+        def raise_():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def resource():
+            loop = asyncio.get_running_loop()
+            yield
+            loop.call_soon(raise_)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                loop.call_soon(raise_)
+                print("TEARDOWN RAISES")
+                raise ValueError("teardown failed as the second interruption arrived")
+
+        @pytest.mark.asyncio
+        async def test_it(resource):
+            pass
+        """,
+        "-W",
+        "error",
+        "-o",
+        "log_cli=true",
+    )
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    out = result.stdout.str()
+    err = result.stderr.str()
+    assert out.count("pytest-asyncio abandoned after a second interruption") == 1
+    result.stdout.fnmatch_lines(
+        [
+            "*TEARDOWN RAISES*",
+            "*Exception from a fixture or test that pytest-asyncio abandoned *",
+            "*ValueError: teardown failed as the second interruption arrived",
+            "*KeyboardInterrupt*",
+        ]
+    )
+    for noise in ("never retrieved", "Task was destroyed"):
+        assert noise not in out + err
+
+
 def test_keyboard_interrupt_from_node_finalizer(pytester: Pytester):
     """
     The item's remaining finalizers are lost to pytest; the runner closes

@@ -6,13 +6,14 @@ import asyncio
 import builtins
 import contextlib
 import contextvars
+import gc
 import inspect
 import sys
 from collections.abc import AsyncGenerator, Iterator
 from typing import Any
 
 import pytest
-from pytest_asyncio._runner import TaskRunner
+from pytest_asyncio._runner import FixtureTask, TaskRunner
 
 _REQUIRES_311 = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
@@ -467,10 +468,14 @@ def test_a_fixture_task_cancelled_before_its_first_step_fails_its_setup():
         loop.set_task_factory(task_factory)
         return loop
 
+    reported = []
     with TaskRunner(loop_factory=loop_factory) as runner:
+        runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
         with pytest.raises(asyncio.CancelledError):
             _start(runner, _plain_fixture())
         _run(runner, _nothing())
+        gc.collect()
+    assert reported == []
 
 
 def test_interruption_before_the_fixture_task_started_fails_its_setup():
@@ -587,3 +592,167 @@ def test_close_finalises_a_fixture_cancelled_at_its_yield():
         ValueError,
         GeneratorExit,
     ]
+
+
+def _root_of(loop: asyncio.AbstractEventLoop) -> asyncio.Task[Any]:
+    (root,) = (t for t in asyncio.all_tasks(loop) if t.get_name() == "pytest-asyncio")
+    return root
+
+
+@_REQUIRES_311
+def test_the_task_owning_the_generator_fixtures_lives_from_the_first_one_on():
+    """
+    A task of the runner's own, named pytest-asyncio, owns the task group
+    of the generator fixtures; there is none before the first such fixture.
+    """
+    seen = {}
+
+    def names() -> set[str]:
+        tasks = asyncio.all_tasks() - {_task()}
+        return {t.get_name() for t in tasks if not t.get_name().startswith("Task-")}
+
+    async def fixture() -> AsyncGenerator[None]:
+        seen["fixture"] = names()
+        yield
+
+    async def test(when: str) -> None:
+        seen[when] = names()
+
+    with TaskRunner() as runner:
+        _run(runner, test("before"))
+        started = _start(runner, fixture(), name="fixture")
+        _run(runner, test("during"))
+        runner.finish_fixture(started)
+        _run(runner, test("after"))
+    assert seen["before"] == set()
+    assert seen["fixture"] == {"pytest-asyncio"}
+    assert seen["during"] == {"fixture", "pytest-asyncio"}
+    assert seen["after"] == {"pytest-asyncio"}
+
+
+@_REQUIRES_311
+def test_a_cancellation_of_the_root_ends_the_normal_work_of_the_loop():
+    """A test cancelling every task, say: it is cancelled, the loop is teardown-only."""
+    log = []
+
+    async def fixture() -> AsyncGenerator[None]:
+        yield
+        log.append("torn down")
+
+    async def cancel_the_root() -> None:
+        _root_of(asyncio.get_running_loop()).cancel()
+        await asyncio.sleep(0)
+        log.append("the test went on")
+
+    with TaskRunner() as runner:
+        started = _start(runner, fixture())
+        with pytest.raises(asyncio.CancelledError):
+            _run(runner, cancel_the_root())
+        _assert_teardown_only(runner)
+        runner.finish_fixture(started)
+    assert log == ["torn down"]
+
+
+def test_a_test_cancelling_and_joining_every_task_fails_with_the_cancellation():
+    """
+    Without generator fixtures the only other task is the runner's waiter;
+    cancelling it interrupts the wait, which cancels the test. Bounded.
+    """
+
+    async def cancel_all_and_join() -> None:
+        others = asyncio.all_tasks() - {_task()}
+        for task in others:
+            task.cancel()
+        await asyncio.gather(*others, return_exceptions=True)
+
+    with TaskRunner() as runner:
+        with pytest.raises(asyncio.CancelledError):
+            _run(runner, cancel_all_and_join())
+        _run(runner, _nothing())
+
+
+@_REQUIRES_311
+def test_a_root_cancelled_before_it_entered_fails_the_fixtures_of_the_scope():
+    """The loop's task factory cancels the first task, which is the root."""
+
+    def loop_factory() -> asyncio.AbstractEventLoop:
+        loop = asyncio.new_event_loop()
+        first = True
+
+        def task_factory(loop, coro, **kwargs):
+            nonlocal first
+            task = asyncio.Task(coro, loop=loop, **kwargs)
+            if first:
+                first = False
+                task.cancel()
+            return task
+
+        loop.set_task_factory(task_factory)
+        return loop
+
+    reported = []
+    with TaskRunner(loop_factory=loop_factory) as runner:
+        runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
+        for _ in range(2):
+            with pytest.raises(asyncio.CancelledError):
+                _start(runner, _plain_fixture())
+        assert _run(runner, _get()) == "unset"
+    assert reported == []
+
+
+def test_an_error_settled_just_before_the_second_interruption_is_reported_once():
+    """
+    The teardown ends with an error in the same loop iteration as the
+    interruption of the wait for it: the interruption is raised, and the
+    error is reported to the loop's exception handler, once.
+    """
+    reported = []
+
+    async def fixture() -> AsyncGenerator[None]:
+        loop = asyncio.get_running_loop()
+        yield
+        _interrupt(loop)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            _interrupt(loop)
+            raise ValueError("settled before the interruption") from None
+
+    with TaskRunner() as runner:
+        runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
+        started = _start(runner, fixture())
+        with pytest.raises(KeyboardInterrupt):
+            runner.finish_fixture(started)
+        _run(runner, _nothing())
+        del started
+        gc.collect()
+    gc.collect()
+    assert [str(ctx["exception"]) for ctx in reported] == [
+        "settled before the interruption"
+    ]
+
+
+@_REQUIRES_311
+def test_a_failure_escaping_a_fixture_task_ends_normal_work_and_is_raised_at_close(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    Fault injection: a bug of the runner's own lets an exception out of a
+    fixture's task. The task group cancels the root, which ends the normal
+    work of the loop, and the group raises the failure when the runner
+    closes; the loop closes all the same.
+    """
+
+    async def buggy(self: FixtureTask[Any]) -> None:
+        raise RuntimeError("a bug in the runner")
+
+    monkeypatch.setattr(FixtureTask, "live", buggy)
+    runner = TaskRunner().__enter__()
+    loop = runner.get_loop()
+    with pytest.raises(RuntimeError, match="a bug in the runner"):
+        _start(runner, _plain_fixture())
+    _assert_teardown_only(runner)
+    with pytest.raises(_BaseExceptionGroup) as info:
+        runner.close()
+    assert [str(exc) for exc in info.value.exceptions] == ["a bug in the runner"]
+    assert loop.is_closed()
