@@ -154,12 +154,12 @@ def test_second_interruption_abandons_hung_cleanup(pytester: Pytester, then: str
     The wait for the cleanup is interrupted too: the interruption reaches
     pytest at once and the abandoned task ends at its next await, the next
     time the loop runs (here, for the async fixture's teardown). Nothing is
-    left pending or unawaited; an error the abandoned cleanup ends with is
-    nobody's to retrieve, and asyncio reports it as such once the task is
-    collected.
+    left pending or unawaited; an error the abandoned cleanup ends with goes
+    to the loop's exception handler, which logs it (pytest shows such logs
+    with live logging, as any asyncio error report during an interruption).
     """
     source = _interrupted_test(cleanup="await hang()", then=then)
-    result = _run(pytester, source, "-W", "error")
+    result = _run(pytester, source, "-W", "error", "-o", "log_cli=true")
     assert result.ret == pytest.ExitCode.INTERRUPTED
     out = result.stdout.str()
     _assert_ordered(
@@ -168,15 +168,14 @@ def test_second_interruption_abandons_hung_cleanup(pytester: Pytester, then: str
     assert "NEXT RAN" not in out
     result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
     err = result.stderr.str()
-    for noise in ("Task was destroyed", "never awaited"):
+    for noise in ("Task was destroyed", "never awaited", "never retrieved"):
         assert noise not in out + err
     if then == "pass":
-        assert "never retrieved" not in out + err
+        assert "abandoned" not in out + err
     else:
-        result.stderr.fnmatch_lines(
+        result.stdout.fnmatch_lines(
             [
-                "Task exception was never retrieved",
-                "future: <Task finished name='test_interrupted' *",
+                "*Exception from a fixture or test that pytest-asyncio abandoned *",
                 "*RuntimeError: abandoned cleanup failed",
             ]
         )

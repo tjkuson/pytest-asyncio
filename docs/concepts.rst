@@ -121,13 +121,13 @@ Cancellation
 
 If a task in the group fails, the group cancels the fixture's task, which is waiting at the ``yield``.
 pytest-asyncio then cancels the test or fixture setup running at the time, which fails with ``asyncio.CancelledError``, and ends the normal work of that event loop: fixture teardowns still run, so that the group can exit and report what happened, but further tests and fixture setups in the loop are refused.
-A refused test fails with an ``asyncio.CancelledError`` explaining the refusal; a refused, cancelled or failed fixture setup or teardown errors with a ``PytestAsyncioError`` carrying the cause, so that pytest handles it like any other fixture error.
+A refused test fails with an ``asyncio.CancelledError`` explaining the refusal; a refused or cancelled fixture setup or teardown errors with a ``PytestAsyncioError`` carrying the cause, so that pytest handles it like any other fixture error.
 The group raises the failure as an ``ExceptionGroup`` when the fixture is torn down, which pytest reports as an error at teardown of that fixture.
 
 With the default function-scoped loop, nothing else would have run in the loop anyway.
 With a wider loop scope, the remaining tests sharing the loop are refused: pytest-asyncio does not know which of them depend on the failed fixture.
 
-The teardown of a fixture that depends on the failed one runs in its own task, so its awaited cleanup completes normally.
+The teardown of a fixture that depends on the failed one runs in its own task, outside the failed fixture's scope, so that scope does not cancel it.
 Until the failed fixture's own teardown exits the scope, an AnyIO cancel scope keeps re-cancelling the fixture's waiting task, which costs some CPU time while the dependent fixtures clean up; nothing hangs.
 
 Context variables
@@ -147,7 +147,7 @@ Interruption
 ------------
 
 When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels its task, as ``asyncio.Runner`` does, and waits for the coroutine to finish, so that ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
-A second interruption abandons the coroutine.
+A second interruption abandons the coroutine: its task is cancelled again, and whatever it ends with is reported through the event loop's exception handler.
 Other fixtures and tests are unaffected.
 
 Limitations

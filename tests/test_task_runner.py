@@ -6,7 +6,6 @@ import asyncio
 import builtins
 import contextlib
 import contextvars
-import gc
 import inspect
 import sys
 from collections.abc import AsyncGenerator, Iterator
@@ -405,8 +404,8 @@ def test_second_interruption_abandons_the_coroutine(then: str):
     """
     A wait for the coroutine's cleanup that is interrupted too ends at
     once; the task is cancelled again and left to end on its own when the
-    loop next runs. A failure then is reported as asyncio reports that of
-    any task nobody awaits, once the task is garbage collected.
+    loop next runs. What it ends with then goes to the loop's exception
+    handler, as the error of a task nobody awaits.
     """
     log = []
     reported = []
@@ -434,7 +433,6 @@ def test_second_interruption_abandons_the_coroutine(then: str):
         assert log == []
         _run(runner, _nothing())
         assert log == ["ended"]
-    gc.collect()
     failures = [type(context.get("exception")) for context in reported]
     assert failures == ([ValueError] if then == "fail" else [])
 
@@ -447,6 +445,96 @@ def test_interruption_after_the_coroutine_ended_is_only_the_interruption():
         with pytest.raises(KeyboardInterrupt):
             _run(runner, job())
         _run(runner, _nothing())
+
+
+def test_a_fixture_task_cancelled_before_its_first_step_fails_its_setup():
+    """
+    The fixture's task ended before running the fixture (a task factory
+    cancelled it, say): its setup fails with the cancellation instead of
+    waiting for a result the task can no longer produce.
+    """
+
+    def loop_factory() -> asyncio.AbstractEventLoop:
+        loop = asyncio.new_event_loop()
+
+        def task_factory(loop, coro, **kwargs):
+            task = asyncio.Task(coro, loop=loop, **kwargs)
+            code = getattr(coro, "cr_code", None)
+            if code is not None and code.co_name == "live":
+                task.cancel()
+            return task
+
+        loop.set_task_factory(task_factory)
+        return loop
+
+    with TaskRunner(loop_factory=loop_factory) as runner:
+        with pytest.raises(asyncio.CancelledError):
+            _start(runner, _plain_fixture())
+        _run(runner, _nothing())
+
+
+def test_interruption_before_the_fixture_task_started_fails_its_setup():
+    """A queued interruption cancels the task before its first step."""
+    with TaskRunner() as runner:
+        _interrupt(runner.get_loop())
+        with pytest.raises(KeyboardInterrupt):
+            _start(runner, _plain_fixture())
+        _run(runner, _nothing())
+
+
+def test_a_fixture_interrupted_after_its_yield_is_still_owned():
+    """
+    An interruption of the wait for the setup after the fixture yielded: the
+    fixture's task is alive and owned, so the runner closes the fixture in
+    its task at loop close instead of leaving it waiting forever.
+    """
+    log = []
+
+    async def fixture() -> AsyncGenerator[None]:
+        _interrupt(asyncio.get_running_loop())
+        try:
+            yield
+        finally:
+            await asyncio.sleep(0)
+            log.append("closed in its task" if _task().get_name() == "f" else "?")
+
+    with TaskRunner() as runner:
+        with pytest.raises(KeyboardInterrupt):
+            _start(runner, fixture(), name="f")
+        _run(runner, _nothing())
+    assert log == ["closed in its task"]
+
+
+def test_an_abandoned_fixture_teardown_reports_its_late_error():
+    """
+    A teardown abandoned after a second interruption ends later; what it
+    ends with goes to the loop's exception handler, as the error of a task
+    nobody awaits, instead of being lost.
+    """
+    reported = []
+
+    async def fixture() -> AsyncGenerator[None]:
+        loop = asyncio.get_running_loop()
+        yield
+        _interrupt(loop)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            _interrupt(loop)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise ValueError("late teardown failure") from None
+
+    with TaskRunner() as runner:
+        runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
+        started = _start(runner, fixture())
+        with pytest.raises(KeyboardInterrupt):
+            runner.finish_fixture(started)
+        assert reported == []
+        _run(runner, _nothing())
+    assert [str(ctx["exception"]) for ctx in reported] == ["late teardown failure"]
+    assert "abandoned" in reported[0]["message"]
 
 
 def test_close_finalises_fixtures_never_torn_down_in_their_tasks():

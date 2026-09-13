@@ -351,20 +351,16 @@ def _run_test(
         raise
 
 
-def _explaining_a_cancelled_fixture(phase: str) -> Callable[[BaseException], None]:
+def _cancelled_fixture_error(phase: str) -> PytestAsyncioError:
     """
-    A cancelled setup or teardown of an async fixture is reported as an
-    Exception: pytest caches the error of a fixture's setup for the fixture's
-    other users, and carries on with the remaining finalizers of a node after
-    a failed teardown, only for one.
+    The error reported for a cancelled setup or teardown of an async fixture.
+
+    An Exception rather than the CancelledError: pytest caches the error of a
+    fixture's setup for the fixture's other users, and carries on with the
+    remaining finalizers of a node after a failed teardown, only for one.
     """
-
-    def explain(exc: BaseException) -> None:
-        if isinstance(exc, asyncio.CancelledError):
-            msg = f"The {phase} of the async fixture was cancelled. " + _CANCELLED_NOTE
-            raise PytestAsyncioError(msg) from exc
-
-    return explain
+    msg = f"The {phase} of the async fixture was cancelled. " + _CANCELLED_NOTE
+    return PytestAsyncioError(msg)
 
 
 def _fixture_synchronizer(
@@ -445,9 +441,8 @@ def _wrap_asyncgen_fixture(
             fixture: FixtureTask[AsyncGenFixtureYieldType] = runner.start_fixture(
                 gen_obj, context=context, name=request.fixturename
             )
-        except BaseException as exc:
-            _explaining_a_cancelled_fixture("setup")(exc)
-            raise
+        except asyncio.CancelledError as exc:
+            raise _cancelled_fixture_error("setup") from exc
 
         assert fixture.context_after is not None
         reset_contextvars = _apply_contextvar_changes(context, fixture.context_after)
@@ -456,9 +451,8 @@ def _wrap_asyncgen_fixture(
             """Yield again, to finalize."""
             try:
                 runner.finish_fixture(fixture)
-            except BaseException as exc:
-                _explaining_a_cancelled_fixture("teardown")(exc)
-                raise
+            except asyncio.CancelledError as exc:
+                raise _cancelled_fixture_error("teardown") from exc
             finally:
                 if reset_contextvars is not None:
                     reset_contextvars()
@@ -494,9 +488,8 @@ def _wrap_async_fixture(
             result, after = runner.run(
                 setup(), context=context, name=request.fixturename
             )
-        except BaseException as exc:
-            _explaining_a_cancelled_fixture("setup")(exc)
-            raise
+        except asyncio.CancelledError as exc:
+            raise _cancelled_fixture_error("setup") from exc
 
         # Copy the context vars modified by the fixture into the current
         # context, and (if needed) add a finalizer to reset them.
