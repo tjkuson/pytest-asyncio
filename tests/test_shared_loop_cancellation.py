@@ -140,21 +140,34 @@ def test_cancelling_every_task_reaches_the_fixture_at_its_yield(
     )
 
 
-def test_cancelling_and_joining_every_task_without_fixtures_fails_at_once(
+def test_cancelling_and_joining_every_task_without_live_fixtures_fails_at_once(
     pytester: Pytester,
 ):
     """
-    Without async generator fixtures, the only other task of the loop is
-    the runner's wait for the test: cancelling it interrupts the wait, which
-    cancels the test. The test fails with CancelledError at once, and the
-    next test on the loop runs. (A test joining the task of a generator
-    fixture would wait for pytest to tear the fixture down: forever.)
+    Without live async generator fixtures, the other tasks of the loop are
+    the runner's wait for the test and, on 3.11+, pytest-asyncio's own task
+    owning the fixtures' group. Cancelling the wait interrupts it, which
+    cancels the test; the owner, cancelled with no fixture to wait for, ends
+    at once. The test fails with CancelledError, promptly; the loop is then
+    teardown-only, so the next test is refused. (A test joining the task of
+    a live generator fixture would wait for pytest to tear the fixture down:
+    forever.)
     """
     result = _run(
         pytester,
         """
         import asyncio
         import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        async def failed_fixture():
+            raise RuntimeError("setup fails before the yield")
+            yield
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_failed_fixture(failed_fixture):
+            pass
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_cancel_and_join():
@@ -170,20 +183,36 @@ def test_cancelling_and_joining_every_task_without_fixtures_fails_at_once(
         """,
         subprocess=True,
     )
-    result.assert_outcomes(failed=1, passed=1)
+    out = result.stdout.str()
     result.stdout.fnmatch_lines(["*_ test_cancel_and_join _*", "*CancelledError*"])
-    assert "JOINED" not in result.stdout.str()
-    assert "NEXT RAN" in result.stdout.str()
+    assert "JOINED" not in out
+    if sys.version_info >= (3, 11):
+        result.assert_outcomes(failed=2, errors=1)
+        assert "NEXT RAN" not in out
+        result.stdout.fnmatch_lines(["*_ test_next _*", _REFUSED])
+    else:
+        result.assert_outcomes(failed=1, passed=1, errors=1)
 
 
 @_NEEDS_TASK_GROUP
-def test_loop_whose_task_factory_cancels_the_first_task(pytester: Pytester):
+@pytest.mark.parametrize(
+    "cancel",
+    [
+        pytest.param("task.cancel()", id="before_its_first_step"),
+        pytest.param("loop.call_soon(task.cancel)", id="right_after_it_entered"),
+    ],
+)
+def test_loop_whose_task_factory_cancels_the_first_task(
+    pytester: Pytester, cancel: str
+):
     """
-    The first task of a loop with async generator fixtures is the task
-    owning them, named pytest-asyncio. Cancelled before it entered its task
-    group, it owns nothing: every generator fixture of the loop fails to
-    start, with the cancellation as a fixture error; tests without such
-    fixtures run, and the loop closes.
+    The first task of a loop is pytest-asyncio's own, which owns the async
+    generator fixtures' task group. Cancelled before it entered the group,
+    it fails the opening of the loop scope, which is reported as a fixture
+    error for every test of the scope, and the loop is closed. Cancelled
+    right after it entered, it ends the normal work of the loop: every
+    test and fixture setup is refused, and the loop closes at the end of
+    the scope.
     """
     result = _run(
         pytester,
@@ -202,16 +231,12 @@ def test_loop_whose_task_factory_cancels_the_first_task(pytester: Pytester):
             pass
 
         @pytest.mark.asyncio(loop_scope="module")
-        async def test_second(resource):
-            pass
-
-        @pytest.mark.asyncio(loop_scope="module")
         async def test_without_fixtures():
             print("RAN WITHOUT FIXTURES")
         """,
         "-p",
         "conftest",
-        conftest="""
+        conftest=f"""
         import asyncio
 
         loops = []
@@ -226,31 +251,34 @@ def test_loop_whose_task_factory_cancels_the_first_task(pytester: Pytester):
                 task = asyncio.Task(coro, loop=loop, **kwargs)
                 if first:
                     first = False
-                    task.cancel()
+                    {cancel}
                 return task
 
             loop.set_task_factory(task_factory)
             return loop
 
         def pytest_asyncio_loop_factories(config, item):
-            return {"cancel-first": cancel_first_task_loop}
+            return {{"cancel-first": cancel_first_task_loop}}
 
         def pytest_sessionfinish(session, exitstatus):
             print("LOOPS CLOSED:", [loop.is_closed() for loop in loops])
         """,
         subprocess=True,
     )
-    result.assert_outcomes(errors=2, passed=1)
     out = result.stdout.str()
     assert "RESOURCE STARTED" not in out
-    assert "RAN WITHOUT FIXTURES" in out
+    assert "RAN WITHOUT FIXTURES" not in out
     assert "LOOPS CLOSED: [True]" in out
-    result.stdout.fnmatch_lines(
-        [
-            "*ERROR at setup of test_first*",
-            "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
-        ]
-    )
+    if cancel == "task.cancel()":
+        result.assert_outcomes(errors=2)
+        result.stdout.fnmatch_lines(
+            ["*PytestAsyncioError: pytest-asyncio's task on this event loop was *"]
+        )
+    else:
+        result.assert_outcomes(errors=1, failed=1)
+        result.stdout.fnmatch_lines(
+            [*_REFUSED_SETUP, "*_ test_without_fixtures _*", _REFUSED]
+        )
 
 
 def test_fixture_cancelled_during_its_setup_fails_only_its_test(pytester: Pytester):

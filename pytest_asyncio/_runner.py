@@ -7,7 +7,7 @@ import contextvars
 import enum
 import sys
 from collections.abc import AsyncGenerator, Callable, Coroutine
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, TypeVar
 
 if sys.version_info >= (3, 11):
     from asyncio import Runner
@@ -38,16 +38,18 @@ class TaskRunner:
     """
     Run the async fixtures and tests of an event loop scope, each in a task.
 
-    A test or a coroutine fixture runs in a task of its own, in a copy of
-    the given context, as with :meth:`asyncio.Runner.run`; :meth:`run`
-    waits for the task to end. An async generator fixture runs in a task of
-    its own that outlives the synchronous call that started it: it stays
-    alive across the fixture's ``yield``, so that the task that entered a
-    task group, cancel scope or timeout before the ``yield`` is the task
-    that exits it at teardown (see :class:`FixtureTask`). The tasks of the
-    generator fixtures are the children of a task group of the runner's
-    own, which lives from the first such fixture until the runner closes
-    (see _FixtureGroup).
+    Each task runs in a copy of the context given for it, as a task copies
+    the context it is created in. A test or a coroutine fixture runs in a
+    task of its own, which :meth:`run` creates on the loop and waits for;
+    an async generator fixture runs in a task of its own that outlives the
+    synchronous call which started it: it stays alive across the fixture's
+    ``yield``, so that the task that entered a task group, cancel scope or
+    timeout before the ``yield`` is the task that exits it at teardown
+    (see :class:`FixtureTask`). Those tasks are the children of a task
+    group of the runner's own, which lives as long as the runner and joins
+    them as it exits (see _FixtureGroup). A test's task is not a child of
+    that group: a task that cancels and joins the tasks of its loop, its
+    owner among them, could never end.
 
     A cancellation of one of the runner's own tasks, e.g. of a fixture's
     task waiting at the ``yield`` by a task group whose child failed, ends
@@ -60,8 +62,9 @@ class TaskRunner:
     callback of the loop) cancels the task being waited for and waits for
     it to end, so that it cleans up before pytest tears down what it may be
     using. A second interruption abandons the wait: the task is cancelled
-    again, and what it ended or ends with is reported to the loop's
-    exception handler.
+    again, what it ended or ends with is reported to the loop's exception
+    handler, and the runner keeps the task until it closes the loop, where
+    asyncio cancels and joins the tasks still alive.
     """
 
     def __init__(
@@ -71,15 +74,23 @@ class TaskRunner:
         loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None,
     ) -> None:
         self._runner = Runner(debug=debug, loop_factory=loop_factory)
-        self._fixtures: _FixtureGroup | None = None
         # The task a cancellation of one of the runner's own tasks is to
         # cancel too (see _end_normal_work): the test or fixture setup
         # pytest waits for.
         self._cancellable: asyncio.Task[Any] | None = None
         self._teardown_only = False
+        # Kept alive until the loop closes; a task nobody references is
+        # garbage collected while pending, its cleanup never run.
+        self._abandoned: list[asyncio.Task[Any]] = []
 
     def __enter__(self) -> Self:
+        """Open the loop and the fixtures' task group, or open nothing."""
         self._runner.__enter__()
+        try:
+            self._fixtures = _FixtureGroup(self)
+        except BaseException:
+            self._runner.close()
+            raise
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -119,8 +130,6 @@ class TaskRunner:
             raise RuntimeError(_RUNNING_LOOP_MESSAGE)
         if self._teardown_only:
             raise asyncio.CancelledError(_REFUSED_MESSAGE)
-        if self._fixtures is None:
-            self._fixtures = _FixtureGroup(self)
         fixture = self._fixtures.spawn(gen, context=context, name=name)
         self._wait_for(fixture.task, fixture.setup, cancellable=True)
         return fixture
@@ -134,8 +143,7 @@ class TaskRunner:
 
     def close(self) -> None:
         try:
-            if self._fixtures is not None:
-                self._fixtures.close()
+            self._fixtures.close()
         finally:
             self._runner.close()
 
@@ -168,8 +176,9 @@ class TaskRunner:
         not the cancellation, is then reported instead of the interruption,
         as asyncio.Runner reports it and as for a synchronous test; an
         outcome that ended, or suppressed, the cancellation does not
-        suppress the interruption. A second interruption cancels the task
-        again and abandons the outcome (see _Outcome.abandon).
+        suppress the interruption. A second interruption abandons the
+        outcome (see _Outcome.abandon) and the task: cancelled once more,
+        it is left to end on its own, at the latest when the loop closes.
         """
         if not outcome.settled.done():
             task.cancel()
@@ -178,24 +187,17 @@ class TaskRunner:
             except BaseException:
                 outcome.abandon()
                 task.cancel()
+                self._abandoned.append(task)
                 raise
         if _failure(outcome.settled) is None:
             raise exc
 
     def _end_normal_work(self) -> None:
-        """One of the runner's own tasks was cancelled (see FixtureTask)."""
+        """One of the runner's own tasks was cancelled: only teardowns from now on."""
         self._teardown_only = True
         if self._cancellable is not None:
             self._cancellable.cancel()
             self._cancellable = None
-
-
-class _Spawner(Protocol):
-    """What creates a fixture's task: the loop scope's task group."""
-
-    def create_task(
-        self, coro: Coroutine[Any, Any, None], *, name: str | None = None
-    ) -> asyncio.Task[None]: ...
 
 
 if sys.version_info >= (3, 11):
@@ -205,21 +207,23 @@ if sys.version_info >= (3, 11):
         The task group of a loop scope's async generator fixtures.
 
         A root task of the runner's, named ``pytest-asyncio``, enters an
-        :class:`asyncio.TaskGroup` and keeps it entered until the runner
-        closes; the fixtures' tasks are the group's children, so their
-        lifetimes are bounded by the root's block and the group joins them
-        as it exits. A fixture delivers what its phases end with to pytest
-        and lets no exception reach the group (see FixtureTask), so one
-        fixture's failure cannot cancel another's task. A failure that does
-        reach the group is the runner's own bug: the group cancels the root
-        and stops accepting fixtures, and raises the failure when the runner
-        closes.
+        :class:`asyncio.TaskGroup` when the runner opens and exits it when
+        the runner closes; the fixtures' tasks are the group's children,
+        so their lifetimes are bounded by the root's block and the group
+        joins them as it exits. A fixture delivers what its phases end with
+        to pytest and lets no exception reach the group (see FixtureTask),
+        so one fixture's failure cannot cancel another's task; an exception
+        that does reach the group is the runner's own bug, which the group
+        raises when the runner closes.
 
-        Any cancellation of the root ends the normal work of the loop; the
-        root keeps the group entered, because the fixtures are torn down by
-        pytest, in its order, until the runner closes. A root cancelled
-        before it entered (by a task factory, say) owns nothing; every
-        fixture of the loop scope then fails to start.
+        A cancellation of the root is a cancellation of the group: the root
+        tells the runner to end the normal work of the loop, and the group
+        cancels its children and waits for them, as any task group does.
+        The fixtures, cancelled at their yield, keep waiting for pytest to
+        tear them down, in its order; the root ends once they have ended,
+        at once if there are none. A root cancelled before it entered the
+        group (by a task factory of the loop, say) fails the runner's
+        opening.
         """
 
         def __init__(self, runner: TaskRunner) -> None:
@@ -228,9 +232,11 @@ if sys.version_info >= (3, 11):
             # The fixtures whose tasks are alive, for close() to decide.
             self._alive: set[FixtureTask[Any]] = set()
             self._closing: asyncio.Future[None] = loop.create_future()
-            self._entered: _Outcome[asyncio.TaskGroup] = _Outcome(loop)
-            self._root = loop.create_task(self._live(), name="pytest-asyncio")
-            self._root.add_done_callback(self._entered.settle_from)
+            entered: _Outcome[asyncio.TaskGroup] = _Outcome(loop)
+            self._root = loop.create_task(self._live(entered), name="pytest-asyncio")
+            self._root.add_done_callback(entered.settle_from)
+            runner._run_until(entered.settled)
+            self._group = entered.settled.result()
 
         def spawn(
             self,
@@ -239,13 +245,10 @@ if sys.version_info >= (3, 11):
             context: contextvars.Context,
             name: str | None,
         ) -> FixtureTask[_T]:
-            """Start the fixture's task in the group."""
-            if not self._entered.settled.done():
-                # The root enters the group in its first step; an
-                # interruption before that leaves it pending, to run later.
-                self._runner._run_until(self._entered.settled)
-            group = self._entered.settled.result()
-            fixture = FixtureTask(self._runner, gen, group, context=context, name=name)
+            """Start the fixture in a task of the group."""
+            fixture: FixtureTask[_T] = FixtureTask(self._runner, gen)
+            create_task = self._group.create_task
+            fixture.start(context.run(create_task, fixture.live(), name=name))
             self._alive.add(fixture)
             fixture.task.add_done_callback(lambda _: self._alive.discard(fixture))
             return fixture
@@ -260,14 +263,14 @@ if sys.version_info >= (3, 11):
             if failure is not None:
                 raise failure
 
-        async def _live(self) -> None:
+        async def _live(self, entered: _Outcome[asyncio.TaskGroup]) -> None:
             async with asyncio.TaskGroup() as group:
-                self._entered.set_result(group)
-                while not self._closing.done():
-                    try:
-                        await _wait_until(self._closing)
-                    except asyncio.CancelledError:
-                        self._runner._end_normal_work()
+                entered.set_result(group)
+                try:
+                    await _wait_until(self._closing)
+                except asyncio.CancelledError:
+                    self._runner._end_normal_work()
+                    raise
 
 else:
 
@@ -290,7 +293,8 @@ else:
             name: str | None,
         ) -> FixtureTask[_T]:
             loop = self._runner.get_loop()
-            fixture = FixtureTask(self._runner, gen, loop, context=context, name=name)
+            fixture: FixtureTask[_T] = FixtureTask(self._runner, gen)
+            fixture.start(context.run(loop.create_task, fixture.live(), name=name))
             self._alive.add(fixture)
             fixture.task.add_done_callback(lambda _: self._alive.discard(fixture))
             return fixture
@@ -372,10 +376,10 @@ class FixtureTask(Generic[_T]):
     The task runs the fixture up to its ``yield``, waits there for pytest's
     decision, and acts on it: it runs the fixture to its end
     (:meth:`resume`), or closes it because the runner is closing
-    (:meth:`close`). While it waits, a cancellation of the task is a
-    scope's (a task group whose child failed, a cancel scope, a timeout):
-    the runner is told, and the task keeps waiting, so that the scope is
-    exited by its own task at teardown.
+    (:meth:`close`). A cancellation of the task while it waits, whether by
+    a scope spanning the ``yield`` or by a direct call, ends the normal
+    work of the loop; the task keeps waiting, so that the fixture's
+    teardown, in this task, is what exits the scope.
 
     What each phase ends with goes to :attr:`setup` and :attr:`teardown`,
     for pytest to wait for; nothing escapes the task. A phase still pending
@@ -383,15 +387,9 @@ class FixtureTask(Generic[_T]):
     the task.
     """
 
-    def __init__(
-        self,
-        runner: TaskRunner,
-        gen: AsyncGenerator[_T],
-        spawner: _Spawner,
-        *,
-        context: contextvars.Context,
-        name: str | None,
-    ) -> None:
+    task: asyncio.Task[None]
+
+    def __init__(self, runner: TaskRunner, gen: AsyncGenerator[_T]) -> None:
         loop = runner.get_loop()
         self._runner = runner
         self._gen = gen
@@ -400,10 +398,11 @@ class FixtureTask(Generic[_T]):
         self.teardown: _Outcome[None] = _Outcome(loop)
         # A copy of the task's context once the fixture was set up.
         self.context_after: contextvars.Context | None = None
-        # The task copies the current context, as any task does; here that
-        # is a copy of the given one.
-        self.task = context.run(spawner.create_task, self.live(), name=name)
-        self.task.add_done_callback(self._task_done)
+
+    def start(self, task: asyncio.Task[None]) -> None:
+        """The task runs :meth:`live`; its end settles a phase still pending."""
+        self.task = task
+        task.add_done_callback(self._task_done)
 
     @property
     def value(self) -> _T:
@@ -419,8 +418,7 @@ class FixtureTask(Generic[_T]):
         if not self._decision.done():
             self._decision.set_result(_Decision.CLOSE)
         else:
-            # The teardown pytest asked for was abandoned; it ends when
-            # cancelled again.
+            # The teardown pytest asked for was abandoned: ask it to end.
             self.task.cancel()
 
     async def live(self) -> None:
@@ -455,7 +453,6 @@ class FixtureTask(Generic[_T]):
             self.teardown.set_exception(ValueError(_DID_NOT_STOP_MESSAGE))
 
     def _task_done(self, task: asyncio.Task[None]) -> None:
-        # A phase still pending ended with the task.
         for phase in (self.setup, self.teardown):
             if not phase.settled.done():
                 phase.settle_from(task)

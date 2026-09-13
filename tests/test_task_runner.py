@@ -9,7 +9,8 @@ import contextvars
 import gc
 import inspect
 import sys
-from collections.abc import AsyncGenerator, Iterator
+import weakref
+from collections.abc import AsyncGenerator, Callable, Iterator
 from typing import Any
 
 import pytest
@@ -600,10 +601,10 @@ def _root_of(loop: asyncio.AbstractEventLoop) -> asyncio.Task[Any]:
 
 
 @_REQUIRES_311
-def test_the_task_owning_the_generator_fixtures_lives_from_the_first_one_on():
+def test_the_task_owning_the_generator_fixtures_lives_as_long_as_the_runner():
     """
     A task of the runner's own, named pytest-asyncio, owns the task group
-    of the generator fixtures; there is none before the first such fixture.
+    of the generator fixtures, from the runner's opening to its close.
     """
     seen = {}
 
@@ -624,10 +625,10 @@ def test_the_task_owning_the_generator_fixtures_lives_from_the_first_one_on():
         _run(runner, test("during"))
         runner.finish_fixture(started)
         _run(runner, test("after"))
-    assert seen["before"] == set()
-    assert seen["fixture"] == {"pytest-asyncio"}
+        root = runner.get_loop()  # the loop is open until the runner closes
+    assert seen["before"] == seen["fixture"] == seen["after"] == {"pytest-asyncio"}
     assert seen["during"] == {"fixture", "pytest-asyncio"}
-    assert seen["after"] == {"pytest-asyncio"}
+    assert root.is_closed()
 
 
 @_REQUIRES_311
@@ -655,8 +656,11 @@ def test_a_cancellation_of_the_root_ends_the_normal_work_of_the_loop():
 
 def test_a_test_cancelling_and_joining_every_task_fails_with_the_cancellation():
     """
-    Without generator fixtures the only other task is the runner's waiter;
-    cancelling it interrupts the wait, which cancels the test. Bounded.
+    Without live generator fixtures the other tasks are the runner's waiter
+    and, on 3.11+, the root owning the fixtures' group. Cancelling the
+    waiter interrupts the wait, which cancels the test; the root, cancelled
+    with no children, ends at once, so the join ends. The test fails with
+    the cancellation, promptly; the loop is teardown-only from then on.
     """
 
     async def cancel_all_and_join() -> None:
@@ -668,35 +672,109 @@ def test_a_test_cancelling_and_joining_every_task_fails_with_the_cancellation():
     with TaskRunner() as runner:
         with pytest.raises(asyncio.CancelledError):
             _run(runner, cancel_all_and_join())
-        _run(runner, _nothing())
+        if sys.version_info >= (3, 11):
+            _assert_teardown_only(runner)
+        else:
+            _run(runner, _nothing())
 
 
-@_REQUIRES_311
-def test_a_root_cancelled_before_it_entered_fails_the_fixtures_of_the_scope():
-    """The loop's task factory cancels the first task, which is the root."""
+def _loop_factory_doing(
+    first: Callable[[asyncio.AbstractEventLoop, asyncio.Task[Any]], None],
+):
+    """A loop factory whose task factory does something to the first task."""
+    loops = []
 
     def loop_factory() -> asyncio.AbstractEventLoop:
         loop = asyncio.new_event_loop()
-        first = True
+        loops.append(loop)
+        seen_first = False
 
         def task_factory(loop, coro, **kwargs):
-            nonlocal first
+            nonlocal seen_first
             task = asyncio.Task(coro, loop=loop, **kwargs)
-            if first:
-                first = False
-                task.cancel()
+            if not seen_first:
+                seen_first = True
+                first(loop, task)
             return task
 
         loop.set_task_factory(task_factory)
         return loop
 
-    reported = []
+    return loop_factory, loops
+
+
+@_REQUIRES_311
+def test_a_root_cancelled_before_it_entered_fails_the_opening_of_the_runner():
+    """The loop's task factory cancels the first task, which is the root."""
+    loop_factory, loops = _loop_factory_doing(lambda loop, task: task.cancel())
+    with pytest.raises(asyncio.CancelledError):
+        TaskRunner(loop_factory=loop_factory).__enter__()
+    (loop,) = loops
+    assert loop.is_closed()
+
+
+@_REQUIRES_311
+def test_a_root_cancelled_right_after_it_entered_makes_the_loop_teardown_only():
+    """The factory queues the cancellation: it lands after the root's first step."""
+    loop_factory, loops = _loop_factory_doing(
+        lambda loop, task: loop.call_soon(task.cancel)
+    )
     with TaskRunner(loop_factory=loop_factory) as runner:
+        _assert_teardown_only(runner)
+    (loop,) = loops
+    assert loop.is_closed()
+
+
+@_REQUIRES_311
+def test_an_interruption_while_the_runner_opens_releases_the_loop():
+    """A callback queued on the new loop raises before the root's first step."""
+    loop_factory, loops = _loop_factory_doing(lambda loop, task: _interrupt(loop))
+    reported = []
+    with pytest.raises(KeyboardInterrupt):
+        TaskRunner(loop_factory=loop_factory).__enter__()
+    (loop,) = loops
+    assert loop.is_closed()
+    gc.collect()
+    assert reported == []
+
+
+def test_an_abandoned_coroutine_is_kept_until_the_loop_closes():
+    """
+    Nobody waits for an abandoned task, but the runner keeps it: a task
+    nobody references is garbage collected while pending, and its cleanup
+    with it. The loop's close cancels it once more and joins it.
+    """
+    events = []
+    reported = []
+    references = []
+
+    async def job() -> None:
+        loop = asyncio.get_running_loop()
+        references.append(weakref.ref(_task()))
+        _interrupt(loop)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("first cleanup")
+            _interrupt(loop)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("nested cleanup")
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("nested cleanup done")
+
+    with TaskRunner() as runner:
         runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
-        for _ in range(2):
-            with pytest.raises(asyncio.CancelledError):
-                _start(runner, _plain_fixture())
-        assert _run(runner, _get()) == "unset"
+        with pytest.raises(KeyboardInterrupt):
+            _run(runner, job())
+        _run(runner, _nothing())
+        gc.collect()
+        assert references[0]() is not None
+        assert events == ["first cleanup", "nested cleanup"]
+    assert events == ["first cleanup", "nested cleanup", "nested cleanup done"]
     assert reported == []
 
 

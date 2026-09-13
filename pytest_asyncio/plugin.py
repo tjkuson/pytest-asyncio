@@ -351,6 +351,12 @@ def _run_test(
         raise
 
 
+_OPENING_CANCELLED_MESSAGE = (
+    "pytest-asyncio's task on this event loop was cancelled before it started "
+    "(by a task factory of the loop?), so the loop cannot run async fixtures."
+)
+
+
 def _cancelled_fixture_error(phase: str) -> PytestAsyncioError:
     """
     The error reported for a cancelled setup or teardown of an async fixture.
@@ -1067,10 +1073,13 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
         new_loop_policy = event_loop_policy
         debug_mode = _get_asyncio_debug(request.config)
         with _temporary_event_loop_policy(new_loop_policy):
-            runner = TaskRunner(
-                debug=debug_mode,
-                loop_factory=_asyncio_loop_factory,
-            ).__enter__()
+            try:
+                runner = TaskRunner(
+                    debug=debug_mode,
+                    loop_factory=_asyncio_loop_factory,
+                ).__enter__()
+            except asyncio.CancelledError as exc:
+                raise PytestAsyncioError(_OPENING_CANCELLED_MESSAGE) from exc
             if _asyncio_loop_factory is not None:
                 _set_event_loop(runner.get_loop())
             try:
