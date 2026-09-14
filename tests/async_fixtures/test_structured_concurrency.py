@@ -33,7 +33,7 @@ _LIBRARIES = [pytest.param("asyncio", marks=_REQUIRES_311), "anyio"]
 # that pytest goes on: with the fixture's other users, or the node's finalizers.
 _CANCELLED = ["*asyncio.exceptions.CancelledError*"]
 if sys.version_info >= (3, 11):
-    _CANCELLED.append("*A task of pytest-asyncio's on this event loop was cancelled: *")
+    _CANCELLED.append("*An async generator fixture was cancelled while it waited at*")
 _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 
 
@@ -134,6 +134,36 @@ def test_one_task_per_fixture_and_test(pytester: Pytester):
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=3)
+
+
+def test_a_cancellation_at_the_end_of_a_fixture_teardown_is_a_teardown_error(
+    pytester: Pytester,
+):
+    """
+    The fixture's task ends cancelled, as any task whose coroutine cancels
+    it and returns; the teardown is read from the task's end, so pytest
+    reports the cancellation, as it did before this change.
+    """
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def resource():
+            yield "ready"
+            asyncio.current_task().cancel("cancelled at the end of the teardown")
+
+        @pytest.mark.asyncio
+        async def test_uses_resource(resource):
+            assert resource == "ready"
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(
+        ["*ERROR at teardown of test_uses_resource*", "*CancelledError*"]
+    )
 
 
 @pytest.mark.parametrize("phase", ["fixture", "setup", "test"])

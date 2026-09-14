@@ -916,3 +916,61 @@ def test_a_fixture_closed_at_close_reports_its_error_without_claiming_an_interru
     assert str(context["exception"]) == "cleanup failed at close"
     assert "interruption" not in context["message"]
     assert "stopped waiting" in context["message"]
+
+
+def test_a_cancellation_at_the_end_of_a_fixture_teardown_is_its_outcome():
+    """The teardown is read from the task's end: the task ended cancelled."""
+
+    async def fixture() -> AsyncGenerator[str]:
+        yield "ready"
+        _task().cancel()
+
+    with TaskRunner() as runner:
+        started = _start(runner, fixture())
+        assert started.setup.value == "ready"
+        with pytest.raises(asyncio.CancelledError):
+            runner.finish_fixture(started)
+        assert started.task.cancelled()
+
+
+@_REQUIRES_311
+def test_a_fixture_task_dying_at_its_yield_fails_its_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    Fault injection: a signal handler raising in the fixture task's own frame
+    while it handles a cancellation at its yield (a timeout plugin's, say)
+    ends the task before pytest asks for the teardown. The teardown then
+    reads how the task ended instead of waiting for a result nobody makes.
+    """
+
+    class TimeoutSignal(BaseException):
+        pass
+
+    def raising(self: TaskRunner) -> None:
+        raise TimeoutSignal("in the fixture task's frame")
+
+    monkeypatch.setattr(TaskRunner, "_stop_normal_work", raising)
+    trigger = asyncio.Event()
+
+    async def fixture() -> AsyncGenerator[None]:
+        async def fail() -> None:
+            await trigger.wait()
+            raise ValueError("child failed")
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(fail())
+            yield
+
+    async def test() -> None:
+        trigger.set()
+        await asyncio.Event().wait()
+
+    runner = TaskRunner()
+    with pytest.raises(_BaseExceptionGroup), runner:
+        started = _start(runner, fixture())
+        with pytest.raises(asyncio.CancelledError):
+            _run(runner, test())
+        assert started.task.done()
+        with pytest.raises(TimeoutSignal):
+            runner.finish_fixture(started)

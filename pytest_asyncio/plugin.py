@@ -327,8 +327,9 @@ def pytest_report_header(config: Config) -> list[str]:
 
 
 _CANCELLED_NOTE = (
-    "A task of pytest-asyncio's on this event loop was cancelled: fixture "
-    "teardowns still run on it, but no new tests or fixture setups."
+    "An async generator fixture was cancelled while it waited at its yield, or "
+    "pytest-asyncio's own task was: fixture teardowns still run on this event "
+    "loop, but no new tests or fixture setups."
 )
 
 _T = TypeVar("_T")
@@ -1035,9 +1036,9 @@ def _get_default_test_loop_scope(config: Config) -> Any:
 
 
 _RUNNER_TEARDOWN_WARNING = """\
-An exception occurred while pytest-asyncio closed the event loop of a scope \
-(was the loop closed by a test?). This warning will become an error in a \
-future version of pytest-asyncio. The traceback of the exception:
+An exception occurred while pytest-asyncio closed the event loop of a scope. \
+This warning will become an error in a future version of pytest-asyncio. The \
+traceback of the exception:
 %s\
 """
 

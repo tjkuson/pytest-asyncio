@@ -22,22 +22,21 @@ Examples:
 .. include:: pytest_asyncio_fixture_example.py
     :code: python
 
+*auto* mode automatically converts coroutines and async generator functions declared with the standard ``@pytest.fixture`` decorator to pytest-asyncio fixtures.
+
 .. _decorators/pytest_asyncio_fixture/cancellation:
 
 Cancellation and errors
 -----------------------
 
-A test cancelled because a task of pytest-asyncio's was cancelled, for example by a task group spanning a fixture's ``yield`` whose child failed, fails with ``asyncio.CancelledError``; on Python 3.11 and later a note explains the cause.
-A fixture setup or teardown cancelled that way errors with ``PytestAsyncioError``, so that pytest caches and reports it like any other fixture error.
+When an async generator fixture is cancelled while it waits at its ``yield``, for example by a task group spanning the ``yield`` whose child failed, the test or fixture setup running at the time is cancelled: the test fails with ``asyncio.CancelledError``, with a note explaining the cause on Python 3.11 and later; a fixture setup or teardown errors with ``PytestAsyncioError``, so that pytest caches and reports it like any other fixture error.
 A test or fixture setup that cannot start because the event loop no longer accepts new work fails with ``RuntimeError``.
-A task group spanning the ``yield`` raises its children's errors as an ``ExceptionGroup`` at the fixture's teardown.
+A task group spanning the ``yield`` reports its children's errors at the fixture's teardown, as it reports them anywhere.
 
 Limitations:
 
 * A cancellation that reaches a fixture's task at its ``yield`` stops all new tests and fixture setups on the whole event loop, including tests that do not use that fixture.
 * A timeout spanning a ``yield`` (``asyncio.timeout``, or ``anyio.fail_after``) that expires while a test runs cancels the test; it does not raise ``TimeoutError`` at the fixture's teardown, because the fixture's teardown exits the timeout without an exception.
 * An AnyIO cancel scope that is cancelled while spanning a ``yield`` keeps cancelling the fixture's waiting task until the fixture's teardown exits it, which costs CPU time for as long as the event loop runs in between, including the cancelled test's cleanup and dependent fixtures' teardowns.
-  The cleanup completes and the errors are reported; this is a limitation of pytest-asyncio's integration with AnyIO's cancellation.
+  Cleanup is not prevented and the errors are reported; the cost is a limitation of pytest-asyncio's integration with AnyIO's cancellation.
 * A test's failure is reported by pytest, not by the test's task: a done callback on the task sees it finish without an exception, and a task cancelled while a failure is raised sees the cancellation.
-
-*auto* mode automatically converts coroutines and async generator functions declared with the standard ``@pytest.fixture`` decorator to pytest-asyncio fixtures.
