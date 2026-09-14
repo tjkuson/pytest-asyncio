@@ -97,7 +97,7 @@ def test_sync_not_auto_marked(pytester: Pytester):
 
 
 def test_each_example_runs_in_a_task_of_its_own(pytester: Pytester):
-    """An example is a run of the test: its own task, its own context."""
+    """Each generated example gets a distinct task."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import asyncio

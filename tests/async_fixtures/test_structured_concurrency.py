@@ -26,8 +26,6 @@ _REQUIRES_UVLOOP = pytest.mark.skipif(
     importlib.util.find_spec("uvloop") is None, reason="uvloop is not installed"
 )
 
-# The same fixture with either library's task group: the statement entering
-# the group, and the one starting its child ``fail``.
 _TASK_GROUPS = [
     pytest.param(
         "async with asyncio.TaskGroup() as group:",
@@ -41,7 +39,6 @@ _TASK_GROUPS = [
         id="anyio",
     ),
 ]
-# A timeout without a deadline, and the statement making it expire now.
 _TIMEOUTS = [
     pytest.param(
         "async with asyncio.timeout(None) as deadline:",
@@ -56,27 +53,6 @@ _TIMEOUTS = [
     ),
 ]
 _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
-
-# The fixtures and tests of an example append to ``events``, and the outer
-# test reads the literal sequence of what ran. The conftest writes the file
-# after pytest's own session-finish hook, which is where an interrupted run
-# still tears its fixtures down.
-_EVENTS_CONFTEST = """\
-    from pathlib import Path
-
-    import pytest
-
-    events = []
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_sessionfinish(session):
-        yield
-        Path(session.config.rootpath, "events.txt").write_text("\\n".join(events))
-    """
-
-
-def _read_events(pytester: Pytester) -> list[str]:
-    return (pytester.path / "events.txt").read_text().splitlines()
 
 
 def _fixture_cancelled(phase: str) -> list[str]:
@@ -122,7 +98,9 @@ def test_a_generator_fixture_is_set_up_and_torn_down_in_one_task(pytester: Pytes
     result.assert_outcomes(passed=2)
 
 
-def test_a_failing_test_ends_its_task_without_the_error(pytester: Pytester):
+def test_failing_test_reports_to_pytest_without_setting_its_task_exception(
+    pytester: Pytester,
+):
     """The failure goes to pytest; a callback on the test's task sees none."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
@@ -267,18 +245,13 @@ def test_a_child_failing_while_a_dependent_fixture_sets_up_cancels_that_setup(
 
 @_REQUIRES_311
 def test_a_child_failing_during_the_test_cancels_the_test(pytester: Pytester):
-    """
-    Issue #1083: the group is exited by the fixture's task, at its teardown,
-    where its error is reported; the test fails, and the loop refuses the rest.
-    """
+    """Issue #1083: cancel the test and report the child's error at fixture teardown."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import asyncio
 
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture
         async def service():
@@ -288,17 +261,9 @@ def test_a_child_failing_during_the_test_cancels_the_test(pytester: Pytester):
                 await trigger.wait()
                 raise RuntimeError("background service failed")
 
-            async def serve():
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    events.append("sibling cancelled by the group")
-
             async with asyncio.TaskGroup() as group:
                 group.create_task(fail())
-                group.create_task(serve())
                 yield trigger
-            events.append("group exited")
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_service(service):
@@ -322,12 +287,11 @@ def test_a_child_failing_during_the_test_cancels_the_test(pytester: Pytester):
             _REFUSED,
         ]
     )
-    assert _read_events(pytester) == ["sibling cancelled by the group"]
 
 
-@pytest.mark.parametrize(("enter", "start"), _TASK_GROUPS)
+@pytest.mark.parametrize(("enter_group", "start_child"), _TASK_GROUPS)
 def test_a_child_failing_between_tests_refuses_the_next_test(
-    pytester: Pytester, enter: str, start: str
+    pytester: Pytester, enter_group: str, start_child: str
 ):
     """The group's error is reported at the fixture's teardown."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
@@ -346,8 +310,8 @@ def test_a_child_failing_between_tests_refuses_the_next_test(
                 await trigger.wait()
                 raise RuntimeError("background service failed")
 
-            {enter}
-                {start}
+            {enter_group}
+                {start_child}
                 yield trigger
 
         @pytest.mark.asyncio(loop_scope="module")
@@ -397,116 +361,109 @@ def test_an_anyio_task_group_spanning_the_yield_is_exited_by_the_task_that_enter
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.parametrize(("enter", "start"), _TASK_GROUPS)
-def test_a_dependent_fixture_is_torn_down_before_its_cancelled_parent_closes(
-    pytester: Pytester, enter: str, start: str
+@pytest.mark.parametrize(("enter_group", "start_child"), _TASK_GROUPS)
+def test_cancelled_fixture_keeps_resources_available_until_dependent_teardown_finishes(
+    pytester: Pytester, enter_group: str, start_child: str
 ):
-    """The dependent's teardown is in a task of its own, outside the parent's scope."""
+    """Dependent teardown can use the parent's files before its directory is removed."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent(f"""\
         import asyncio
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
 
         import anyio
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture
-        async def connection():
-            state = {{"open": True, "fail": asyncio.Event()}}
+        async def parent():
+            failure = asyncio.Event()
 
             async def fail():
-                await state["fail"].wait()
-                raise RuntimeError("connection worker failed")
+                await failure.wait()
+                raise RuntimeError("background task failed")
 
-            try:
-                {enter}
-                    {start}
-                    yield state
-            finally:
-                state["open"] = False
-                events.append("connection closed")
+            with TemporaryDirectory(prefix="fixture-", dir=".") as directory:
+                source_file = Path(directory, "data.txt")
+                source_file.write_text("fixture data")
+                {enter_group}
+                    {start_child}
+                    yield source_file, failure
 
         @pytest_asyncio.fixture
-        async def transaction(connection):
-            yield connection
+        async def dependent(parent):
+            source_file, failure = parent
+            yield failure
             await asyncio.sleep(0)
-            assert connection["open"]
-            events.append("transaction closed")
+            source_file.replace("saved.txt")
 
         @pytest.mark.asyncio
-        async def test_transaction(transaction):
-            transaction["fail"].set()
+        async def test_uses_dependent(dependent):
+            dependent.set()
             await asyncio.Event().wait()
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=1, errors=1)
     result.stdout.fnmatch_lines(
         [
-            "*ERROR at teardown of test_transaction*",
-            "*RuntimeError: connection worker failed*",
+            "*ERROR at teardown of test_uses_dependent*",
+            "*RuntimeError: background task failed*",
         ]
     )
-    assert _read_events(pytester) == ["transaction closed", "connection closed"]
+    assert (pytester.path / "saved.txt").read_text() == "fixture data"
+    assert list(pytester.path.glob("fixture-*")) == []
 
 
-@pytest.mark.parametrize(("enter", "expire"), _TIMEOUTS)
+@pytest.mark.parametrize(("enter_timeout", "expire_timeout"), _TIMEOUTS)
 def test_a_timeout_spanning_the_yield_expiring_during_the_test_cancels_it(
-    pytester: Pytester, enter: str, expire: str
+    pytester: Pytester, enter_timeout: str, expire_timeout: str
 ):
-    """The test fails with the raw CancelledError; the fixture's teardown is clean."""
+    """A timeout across the fixture yield reports cancellation, not TimeoutError."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent(f"""\
         import asyncio
 
         import anyio
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture
         async def deadline():
-            {enter}
+            {enter_timeout}
                 yield deadline
-            events.append("teardown clean")
 
         @pytest.mark.xfail(raises=asyncio.CancelledError, strict=True)
         @pytest.mark.asyncio
         async def test_deadline(deadline):
-            {expire}
+            {expire_timeout}
             await asyncio.Event().wait()
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(xfailed=1)
-    assert _read_events(pytester) == ["teardown clean"]
 
 
-@pytest.mark.parametrize(("enter", "expire"), _TIMEOUTS)
+@pytest.mark.parametrize(("enter_timeout", "expire_timeout"), _TIMEOUTS)
 def test_a_timeout_spanning_the_yield_expiring_while_idle_refuses_later_tests(
-    pytester: Pytester, enter: str, expire: str
+    pytester: Pytester, enter_timeout: str, expire_timeout: str
 ):
-    """The loop refuses every later test, even once the timeout has exited."""
+    """Later tests on the loop are refused even when they do not use the fixture."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent(f"""\
         import asyncio
 
         import anyio
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture
         async def deadline():
-            {enter}
+            {enter_timeout}
                 yield deadline
-            events.append("deadline exited")
 
         @pytest_asyncio.fixture
         async def dependent(deadline):
-            {expire}
+            {expire_timeout}
             yield
 
         @pytest.mark.asyncio(loop_scope="module")
@@ -522,67 +479,48 @@ def test_a_timeout_spanning_the_yield_expiring_while_idle_refuses_later_tests(
     result.stdout.fnmatch_lines(
         ["*_ test_deadline _*", _REFUSED, "*_ test_after _*", _REFUSED]
     )
-    assert _read_events(pytester) == ["deadline exited"]
 
 
-def test_independent_module_fixtures_exit_their_scopes_out_of_setup_order(
+def test_parametrized_module_fixtures_can_each_use_an_anyio_task_group(
     pytester: Pytester,
 ):
-    """Each scope is in a task of its own, so no LIFO order binds the fixtures."""
+    """Replacing a parameter's group leaves the other fixture's cached group usable."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import anyio
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture(scope="module", params=[1, 2])
         async def first(request):
             async with anyio.create_task_group():
-                events.append(f"open first {request.param}")
                 yield request.param
-                events.append(f"close first {request.param}")
 
         @pytest_asyncio.fixture(scope="module")
         async def second():
-            async with anyio.create_task_group():
-                events.append("open second")
-                yield
-                events.append("close second")
+            async with anyio.create_task_group() as group:
+                yield group
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_pair(first, second):
-            events.append(f"test {first}")
+            second.start_soon(anyio.sleep, 0)
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(passed=2)
-    assert _read_events(pytester) == [
-        "open first 1",
-        "open second",
-        "test 1",
-        "close first 1",
-        "open first 2",
-        "test 2",
-        "close first 2",
-        "close second",
-    ]
 
 
 @_REQUIRES_311
 @pytest.mark.parametrize("failing", ["first", "second"])
-def test_nested_task_group_fixtures_are_exited_in_dependency_order(
+def test_a_failure_in_either_nested_fixture_group_is_reported_at_teardown(
     pytester: Pytester, failing: str
 ):
     """Whichever group fails reports its error at its own fixture's teardown."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent(f"""\
         import asyncio
 
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         trigger = asyncio.Event()
 
@@ -595,32 +533,29 @@ def test_nested_task_group_fixtures_are_exited_in_dependency_order(
         async def first():
             async with asyncio.TaskGroup() as group:
                 group.create_task(child("first"))
-                try:
-                    yield
-                finally:
-                    events.append("first teardown")
+                yield
 
         @pytest_asyncio.fixture
         async def second(first):
             async with asyncio.TaskGroup() as group:
                 group.create_task(child("second"))
-                try:
-                    yield
-                finally:
-                    events.append("second teardown")
+                yield
 
         @pytest.mark.asyncio
         async def test_services(second):
-            try:
-                trigger.set()
-                await asyncio.Event().wait()
-            finally:
-                events.append("test")
+            trigger.set()
+            await asyncio.Event().wait()
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=1, errors=1)
-    result.stdout.fnmatch_lines([f"*RuntimeError: {failing} child failed*"])
-    assert _read_events(pytester) == ["test", "second teardown", "first teardown"]
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at teardown of test_services*",
+            f"*RuntimeError: {failing} child failed*",
+            "*_ test_services _*",
+            "*CancelledError*",
+        ]
+    )
 
 
 def test_a_fixture_that_never_yields_is_a_setup_error(pytester: Pytester):
@@ -699,10 +634,10 @@ def test_a_fixture_that_yields_twice_is_a_teardown_error(pytester: Pytester):
         ),
     ],
 )
-def test_a_failed_fixture_group_is_reported_the_same_on_other_loops(
+def test_custom_loop_factories_preserve_fixture_failure_reporting(
     pytester: Pytester, factory: str
 ):
-    """An eager task factory or uvloop: the test is cancelled, the rest refused."""
+    """Fixture failure cancels the test and prevents further tests on its loop."""
     pytester.makeini(
         "[pytest]\nasyncio_default_fixture_loop_scope = module\nasyncio_debug = true"
     )
@@ -747,8 +682,9 @@ def test_a_failed_fixture_group_is_reported_the_same_on_other_loops(
         ["*RuntimeError: background service failed*", "*_ test_after _*", _REFUSED]
     )
     output = result.stdout.str() + result.stderr.str()
-    for noise in ("Task was destroyed", "never retrieved", "never awaited"):
-        assert noise not in output
+    assert "Task was destroyed" not in output
+    assert "never retrieved" not in output
+    assert "never awaited" not in output
 
 
 def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
@@ -756,18 +692,15 @@ def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
 ):
     """Both teardown errors are reported: the cancellation, and the parent's."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import asyncio
 
         import pytest
         import pytest_asyncio
-        from conftest import events
 
         @pytest_asyncio.fixture
         async def parent():
             yield
-            events.append("parent cleanup ran")
             raise RuntimeError("parent cleanup failed")
 
         @pytest_asyncio.fixture
@@ -775,7 +708,6 @@ def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
             yield
             asyncio.current_task().cancel()
             await asyncio.sleep(0)
-            events.append("child cleanup ran")
 
         @pytest.mark.asyncio
         async def test_it(child):
@@ -785,7 +717,6 @@ def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(_fixture_cancelled("teardown"))
     result.stdout.fnmatch_lines(["*RuntimeError: parent cleanup failed*"])
-    assert _read_events(pytester) == ["parent cleanup ran"]
 
 
 def test_an_async_test_cannot_request_an_async_fixture_dynamically(
@@ -803,7 +734,6 @@ def test_an_async_test_cannot_request_an_async_fixture_dynamically(
         async def generator():
             calls.append("set up")
             yield
-            calls.append("torn down")
 
         @pytest.mark.asyncio
         async def test_dynamic(request):

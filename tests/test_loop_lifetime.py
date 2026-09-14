@@ -22,7 +22,13 @@ def test_a_custom_loop_remains_current_while_it_closes(pytester: Pytester):
     pytester.makeconftest(dedent("""\
         import asyncio
 
-        closed_while_current = []
+        import pytest
+
+        _closed_while_current = []
+
+        @pytest.fixture
+        def closed_while_current():
+            return _closed_while_current
 
         class Loop(asyncio.SelectorEventLoop):
             def close(self):
@@ -31,7 +37,7 @@ def test_a_custom_loop_remains_current_while_it_closes(pytester: Pytester):
                         current = asyncio.get_event_loop()
                     except RuntimeError:
                         current = None
-                    closed_while_current.append(current is self)
+                    _closed_while_current.append(current is self)
                 super().close()
 
         def pytest_asyncio_loop_factories(config, item):
@@ -39,13 +45,12 @@ def test_a_custom_loop_remains_current_while_it_closes(pytester: Pytester):
         """))
     pytester.makepyfile(dedent("""\
         import pytest
-        from conftest import closed_while_current
 
         @pytest.mark.asyncio
         async def test_uses_the_loop():
             pass
 
-        def test_the_loop_was_current_while_it_closed():
+        def test_the_loop_was_current_while_it_closed(closed_while_current):
             assert closed_while_current == [True]
         """))
     result = pytester.runpytest("--asyncio-mode=strict", "-W", "error")
@@ -97,10 +102,10 @@ def test_a_loop_that_cannot_create_tasks_is_closed_and_the_error_reported(
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(errors=2)
     result.stdout.fnmatch_lines(["*RuntimeError: no tasks on this loop*"])
-    assert "LOOPS CLOSED: [True]" in result.stdout.str()
+    assert "LOOPS CLOSED: [True]" in result.stdout.lines
 
 
-def test_an_interruption_before_the_loop_served_anything_closes_it(
+def test_an_interruption_before_the_first_async_test_still_closes_the_loop(
     pytester: Pytester,
 ):
     """A callback the loop factory scheduled raises: the loop closes cleanly."""
@@ -141,6 +146,6 @@ def test_an_interruption_before_the_loop_served_anything_closes_it(
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
     output = result.stdout.str() + result.stderr.str()
-    assert "LOOPS CLOSED: [True]" in output
+    assert "LOOPS CLOSED: [True]" in result.stdout.lines
     for noise in ("Task was destroyed", "never awaited", "never retrieved"):
         assert noise not in output

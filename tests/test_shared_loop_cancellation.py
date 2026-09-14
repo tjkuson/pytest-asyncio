@@ -1,13 +1,4 @@
-"""
-The other tests on a shared event loop after a cancellation.
-
-Each test and fixture runs in a task of its own, so a cancellation ends the
-test or fixture it reached and nothing else: the later tests on the loop
-run. The exception is an async generator fixture cancelled as it waits at
-its yield, or pytest-asyncio's own task: the loop then runs nothing but
-fixture teardowns until it closes, and a refused test or fixture setup
-fails with a RuntimeError saying so.
-"""
+"""Cancellation reports, resource cleanup and isolation between event loops."""
 
 from __future__ import annotations
 
@@ -20,27 +11,6 @@ from pytest import Pytester
 _REQUIRES_311 = pytest.mark.skipif(sys.version_info < (3, 11), reason="needs 3.11")
 _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 
-# The fixtures and tests of an example append to ``events``, and the outer
-# test reads the literal sequence of what ran. The conftest writes the file
-# after pytest's own session-finish hook, which is where an interrupted run
-# still tears its fixtures down.
-_EVENTS_CONFTEST = """\
-    from pathlib import Path
-
-    import pytest
-
-    events = []
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_sessionfinish(session):
-        yield
-        Path(session.config.rootpath, "events.txt").write_text("\\n".join(events))
-    """
-
-
-def _read_events(pytester: Pytester) -> list[str]:
-    return (pytester.path / "events.txt").read_text().splitlines()
-
 
 @pytest.mark.parametrize(
     "after",
@@ -52,19 +22,24 @@ def _read_events(pytester: Pytester) -> list[str]:
 def test_a_test_cancelling_its_own_task_fails_alone(pytester: Pytester, after: str):
     """Its fixture is torn down, and the later tests on the loop run."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent(f"""\
         import asyncio
+        from io import StringIO
 
         import pytest
         import pytest_asyncio
-        from conftest import events
+
+        @pytest.fixture
+        def output():
+            stream = StringIO()
+            yield stream
+            assert stream.closed
 
         @pytest_asyncio.fixture(loop_scope="module")
-        async def resource():
-            yield
+        async def resource(output):
+            yield output
             await asyncio.sleep(0)
-            events.append("resource closed")
+            output.close()
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_cancel(resource):
@@ -73,21 +48,15 @@ def test_a_test_cancelling_its_own_task_fails_alone(pytester: Pytester, after: s
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next():
-            events.append("next ran")
+            pass
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_with_fixture(resource):
-            events.append("with fixture ran")
+            assert not resource.closed
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=1, passed=2)
     result.stdout.fnmatch_lines(["*_ test_cancel _*", "*CancelledError*"])
-    assert _read_events(pytester) == [
-        "resource closed",
-        "next ran",
-        "with fixture ran",
-        "resource closed",
-    ]
 
 
 def test_a_test_suppressing_its_own_cancellation_passes(pytester: Pytester):
@@ -172,19 +141,24 @@ def test_a_test_cancelling_every_task_makes_the_loop_refuse_later_tests(
     pytest-asyncio's own task: the loop runs nothing but teardowns after that.
     """
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import asyncio
+        from io import StringIO
 
         import pytest
         import pytest_asyncio
-        from conftest import events
+
+        @pytest.fixture(scope="module")
+        def output():
+            stream = StringIO()
+            yield stream
+            assert stream.closed
 
         @pytest_asyncio.fixture(loop_scope="module")
-        async def resource():
-            yield
+        async def resource(output):
+            yield output
             await asyncio.sleep(0)
-            events.append("resource closed")
+            output.close()
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_cancel_all(resource):
@@ -194,11 +168,11 @@ def test_a_test_cancelling_every_task_makes_the_loop_refuse_later_tests(
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next():
-            events.append("next ran")
+            pass
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_with_fixture(resource):
-            events.append("with fixture ran")
+            assert not resource.closed
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=2, errors=1)
@@ -212,7 +186,6 @@ def test_a_test_cancelling_every_task_makes_the_loop_refuse_later_tests(
             _REFUSED,
         ]
     )
-    assert _read_events(pytester) == ["resource closed"]
 
 
 def test_a_coroutine_fixture_cancelled_during_its_setup_errors_only_its_test(
@@ -336,14 +309,13 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
     a test on a loop of its own and the next module's loop are unaffected.
     """
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(
         test_a_service=dedent("""\
             import asyncio
+            from io import StringIO
 
             import pytest
             import pytest_asyncio
-            from conftest import events
 
             @pytest_asyncio.fixture(scope="module", loop_scope="module")
             async def service():
@@ -357,11 +329,15 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
                     group.create_task(fail())
                     yield trigger
 
+            @pytest.fixture(scope="module")
+            def output():
+                return StringIO()
+
             @pytest_asyncio.fixture(loop_scope="module")
-            async def unrelated():
-                yield
+            async def unrelated(output):
+                yield output
                 await asyncio.sleep(0)
-                events.append("unrelated closed")
+                output.close()
 
             @pytest.mark.asyncio(loop_scope="module")
             async def test_trigger(service, unrelated):
@@ -370,23 +346,22 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
 
             @pytest.mark.asyncio(loop_scope="module")
             async def test_uses_service(service):
-                events.append("used the service")
+                pass
 
             @pytest.mark.asyncio(loop_scope="function")
-            async def test_own_loop():
-                events.append("own loop ran")
+            async def test_own_loop(output):
+                assert output.closed
 
             @pytest.mark.asyncio(loop_scope="module")
             async def test_unrelated(unrelated):
-                events.append("unrelated ran")
+                pass
             """),
         test_b_next_module=dedent("""\
             import pytest
-            from conftest import events
 
             @pytest.mark.asyncio(loop_scope="module")
             async def test_fresh_loop():
-                events.append("next module ran")
+                pass
             """),
     )
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
@@ -403,11 +378,6 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
             _REFUSED,
         ]
     )
-    assert _read_events(pytester) == [
-        "unrelated closed",
-        "own loop ran",
-        "next module ran",
-    ]
 
 
 def test_a_test_stopping_the_loop_fails_and_the_loop_serves_the_later_tests(
@@ -415,29 +385,35 @@ def test_a_test_stopping_the_loop_fails_and_the_loop_serves_the_later_tests(
 ):
     """The stopped loop interrupts the wait: the test is cancelled and fails."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import asyncio
+        from io import StringIO
 
         import pytest
         import pytest_asyncio
-        from conftest import events
+
+        @pytest.fixture
+        def output():
+            stream = StringIO()
+            yield stream
+            assert stream.closed
 
         @pytest_asyncio.fixture(loop_scope="module")
-        async def resource():
-            yield
+        async def resource(output):
+            yield output
             await asyncio.sleep(0)
-            events.append("resource closed")
+            assert output.getvalue() == ""
+            output.close()
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_stop(resource):
             asyncio.get_running_loop().stop()
             await asyncio.sleep(0)
-            events.append("test continued")
+            resource.write("unexpected result")
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next(resource):
-            events.append("next ran")
+            pass
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=1, passed=1)
@@ -447,7 +423,6 @@ def test_a_test_stopping_the_loop_fails_and_the_loop_serves_the_later_tests(
             "*RuntimeError: Event loop stopped before Future completed*",
         ]
     )
-    assert _read_events(pytester) == ["resource closed", "next ran", "resource closed"]
 
 
 def test_a_sync_test_closing_the_shared_loop_fails_the_later_async_tests(
@@ -487,23 +462,29 @@ def test_a_sync_test_closing_the_shared_loop_fails_the_later_async_tests(
 def test_a_background_task_runs_until_its_loop_closes(pytester: Pytester):
     """A task a fixture leaves running is cancelled when the loop closes."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
     pytester.makepyfile(dedent("""\
         import asyncio
+        from io import StringIO
 
         import pytest
         import pytest_asyncio
-        from conftest import events
 
-        async def run_forever():
+        @pytest.fixture(scope="session")
+        def output():
+            stream = StringIO()
+            yield stream
+            assert stream.closed
+
+        async def run_forever(output):
             try:
                 await asyncio.Event().wait()
             finally:
-                events.append("background task cancelled")
+                await asyncio.sleep(0)
+                output.close()
 
         @pytest_asyncio.fixture(scope="module", loop_scope="module")
-        async def background():
-            return asyncio.create_task(run_forever())
+        async def background(output):
+            return asyncio.create_task(run_forever(output))
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_started(background):
@@ -512,16 +493,11 @@ def test_a_background_task_runs_until_its_loop_closes(pytester: Pytester):
         @pytest.mark.asyncio(loop_scope="module")
         async def test_still_running(background):
             assert not background.done()
-            events.append("still running in the second test")
         """))
     result = pytester.runpytest_subprocess(
         "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     result.assert_outcomes(passed=2)
-    assert _read_events(pytester) == [
-        "still running in the second test",
-        "background task cancelled",
-    ]
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 

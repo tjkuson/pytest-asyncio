@@ -433,11 +433,17 @@ def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_th
         import asyncio
         import contextvars
 
-        trace = contextvars.ContextVar("trace")
+        import pytest
+
+        _trace = contextvars.ContextVar("trace")
+
+        @pytest.fixture
+        def trace():
+            return _trace
 
         def traced_task_factory(loop, coro, **kwargs):
             context = contextvars.copy_context()
-            context.run(trace.set, "instrumented")
+            context.run(_trace.set, "instrumented")
             return context.run(asyncio.Task, coro, loop=loop, **kwargs)
 
         def traced_loop_factory():
@@ -452,18 +458,16 @@ def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_th
         import pytest
         import pytest_asyncio
 
-        from conftest import trace
-
         @pytest_asyncio.fixture
-        async def traced_fixture():
+        async def traced_fixture(trace):
             assert trace.get() == "instrumented"
 
         @pytest.fixture
-        def sync_dependent(traced_fixture):
+        def sync_dependent(traced_fixture, trace):
             assert trace.get() == "instrumented"
 
         @pytest.mark.asyncio
-        async def test(sync_dependent):
+        async def test(sync_dependent, trace):
             assert trace.get() == "instrumented"
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
