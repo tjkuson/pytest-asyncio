@@ -13,12 +13,13 @@ tasks, and closes the loop.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import enum
 import sys
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 from dataclasses import dataclass
-from typing import Any, Generic, NoReturn, TypeVar
+from typing import Any, Generic, TypeVar
 
 if sys.version_info >= (3, 11):
     from asyncio import Runner
@@ -28,7 +29,6 @@ else:
     from typing_extensions import Self, assert_never
 
 _T = TypeVar("_T")
-_R = TypeVar("_R")
 
 REFUSED_MESSAGE = (
     "This event loop no longer accepts new tests or fixture setups: an async "
@@ -50,6 +50,12 @@ class TaskRunner:
     whose child failed, say), or the runner's own task was: the test or
     setup running at the time is cancelled, and only teardowns run until
     the loop closes (see FixtureTask, and _stop_normal_work).
+
+    An interruption of a wait (SIGINT, or a callback raising) cancels the
+    task waited for and waits for it to end, so that it cleans up before
+    pytest tears down the fixtures it may use, and raises what the cleanup
+    raised instead of the interruption, as asyncio.Runner does. A second
+    interruption stops waiting (see _join_or_abandon).
     """
 
     def __init__(
@@ -114,12 +120,13 @@ class TaskRunner:
         task = self._group.create_task(captured.run(coro), context=context, name=name)
         # A task cancelled before its first step never started the coroutine.
         task.add_done_callback(lambda _: coro.close())
-        return self._drive(
-            task,
-            active=True,
-            result=lambda: captured.read(task),
-            unobserved=captured.report_unobserved,
-        )
+        with self._as_active(task):
+            interruption = self._drive_until(task)
+            if interruption is None:
+                return captured.read(task)
+            task.cancel()
+            self._join_or_abandon(task, captured.report_unobserved)
+            raise captured.failure() or interruption
 
     def start_fixture(
         self,
@@ -137,24 +144,36 @@ class TaskRunner:
         )
         self._fixtures.add(fixture)
         fixture.task.add_done_callback(lambda _: self._fixtures.discard(fixture))
-        self._drive(
-            fixture.task,
-            until=fixture.ready,
-            active=True,
-            result=lambda: fixture.setup,
-            unobserved=fixture.report_unobserved,
-        )
-        return fixture
+        with self._as_active(fixture.task):
+            interruption = self._drive_until(fixture.task, fixture.ready)
+            if interruption is None:
+                fixture.setup_result()  # raises if the setup failed
+                return fixture
+            if not fixture.ready.done():
+                fixture.task.cancel()
+                self._join_or_abandon(
+                    fixture.task, fixture.report_unobserved, fixture.ready
+                )
+        # Interrupted, the fixture is not handed to pytest, which will not
+        # tear it down: it ends here, before pytest tears down the fixtures
+        # it depends on. One that yielded all the same is torn down, as
+        # pytest would have.
+        if fixture.yielded:
+            fixture.request_teardown()
+            self._join_or_abandon(fixture.task, fixture.report_unobserved)
+            raise fixture.teardown_failure() or interruption
+        raise fixture.setup_failure() or interruption
 
     def finish_fixture(self, fixture: FixtureTask[Any]) -> None:
         """Run the fixture from its yield to its end, in its task."""
         fixture.request_teardown()
-        self._drive(
-            fixture.task,
-            active=False,
-            result=fixture.teardown_result,
-            unobserved=fixture.report_unobserved,
-        )
+        interruption = self._drive_until(fixture.task)
+        if interruption is None:
+            fixture.teardown_result()
+            return
+        fixture.task.cancel()
+        self._join_or_abandon(fixture.task, fixture.report_unobserved)
+        raise fixture.teardown_failure() or interruption
 
     def _admit(self, work: Coroutine[Any, Any, Any] | AsyncGenerator[Any]) -> None:
         """Refuse new work before it has a task, or a place as the active one."""
@@ -165,69 +184,50 @@ class TaskRunner:
             _close(work)
             raise RuntimeError(REFUSED_MESSAGE)
 
-    def _drive(
-        self,
-        task: asyncio.Task[object],
-        *,
-        active: bool,
-        result: Callable[[], _R],
-        unobserved: Callable[[asyncio.Task[object]], None],
-        until: asyncio.Future[Any] | None = None,
-    ) -> _R:
-        """
-        Drive the loop until the task ends, or ``until`` is done; read the result.
-
-        An interruption of the wait (SIGINT, or a callback raising) cancels
-        the task and drives it to its end, so that it cleans up before pytest
-        tears down what it may be using; a failure of that cleanup is then
-        raised instead of the interruption, as asyncio.Runner raises it. A
-        second interruption stops waiting: the task is left to end on its own,
-        with ``unobserved`` to report what it ends with, and is cancelled once
-        more at close.
-        """
-        waiters: list[asyncio.Future[Any]] = [task] if until is None else [task, until]
-        self._active = task if active else None
+    @contextlib.contextmanager
+    def _as_active(self, task: asyncio.Task[object]) -> Iterator[None]:
+        """The test or setup pytest waits for, cancelled by _stop_normal_work."""
+        self._active = task
         try:
-            try:
-                self._driver.run(
-                    asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-                )
-            except BaseException as exc:
-                interruption = exc
-            else:
-                return result()
-            self._interrupted(
-                task, interruption, waiters, result=result, unobserved=unobserved
-            )
+            yield
         finally:
             self._active = None
 
-    def _interrupted(
+    def _join_or_abandon(
         self,
         task: asyncio.Task[object],
-        interruption: BaseException,
-        waiters: list[asyncio.Future[Any]],
-        *,
-        result: Callable[[], object],
         unobserved: Callable[[asyncio.Task[object]], None],
-    ) -> NoReturn:
-        # A fixture whose setup is ready lives on, as it should: it is not
-        # cancelled for the interruption.
-        if not any(waiter.done() for waiter in waiters):
+        *also: asyncio.Future[Any],
+    ) -> None:
+        """
+        Drive the loop until the task ends, or one of the other futures is done.
+
+        A second interruption stops waiting: the task is cancelled again and
+        left to end on its own, ``unobserved`` reports what it ends with, and
+        close cancels it once more.
+        """
+        interruption = self._drive_until(task, *also)
+        if interruption is not None:
+            task.add_done_callback(unobserved)
             task.cancel()
-            try:
-                self._driver.run(asyncio.wait([task]))
-            except BaseException:
-                task.add_done_callback(unobserved)
-                task.cancel()
-                self._abandoned.add(task)
-                task.add_done_callback(self._abandoned.discard)
-                raise
+            self._abandoned.add(task)
+            task.add_done_callback(self._abandoned.discard)
+            raise interruption
+
+    def _drive_until(self, *waiters: asyncio.Future[Any]) -> BaseException | None:
+        """Run the loop until a waiter is done; return the interruption, if any."""
+        # The driver runs the wait in a task of its own, which a callback
+        # raising leaves behind, pending: released ends it with this call.
+        released: asyncio.Future[None] = self.get_loop().create_future()
         try:
-            result()
-        except asyncio.CancelledError:
-            pass
-        raise interruption
+            self._driver.run(
+                asyncio.wait([*waiters, released], return_when=asyncio.FIRST_COMPLETED)
+            )
+        except BaseException as interruption:
+            return interruption
+        finally:
+            released.cancel()
+        return None
 
     def _stop_normal_work(self) -> None:
         """A fixture waiting at its yield, or the runner's task, was cancelled."""
@@ -322,7 +322,7 @@ else:
 
         def __init__(self, driver: Runner) -> None:
             self._driver = driver
-            self._tasks: set[asyncio.Task[Any]] = set()
+            self._tasks: set[asyncio.Task[object]] = set()
 
         def create_task(
             self,
@@ -380,6 +380,10 @@ class _Captured(Generic[_T]):
         if self._result is None:
             raise RuntimeError("The task ended without a result")
         return self._result.value
+
+    def failure(self) -> BaseException | None:
+        """What the coroutine raised, if anything."""
+        return self._result if isinstance(self._result, BaseException) else None
 
     def report_unobserved(self, task: asyncio.Task[object]) -> None:
         """A done callback for a task nobody reads: report an exception to the loop."""
@@ -441,13 +445,31 @@ class FixtureTask(Generic[_T]):
         self.ready: asyncio.Future[FixtureSetup[_T]] = loop.create_future()
         self._action: asyncio.Future[_TeardownAction] = loop.create_future()
 
-    @property
-    def setup(self) -> FixtureSetup[_T]:
+    def setup_result(self) -> FixtureSetup[_T]:
         """The setup's result; raises if it failed, or the task ended before it."""
         if self.ready.done():
             return self.ready.result()
         self.task.result()
         raise RuntimeError("The fixture task ended before its setup")
+
+    @property
+    def yielded(self) -> bool:
+        """The setup reached the yield: the task waits there, or tears down."""
+        return self.ready.done() and self.ready.exception() is None
+
+    def setup_failure(self) -> BaseException | None:
+        """
+        What the setup raised, if an error.
+
+        A cancellation is none, nor is a return before the yield: cancelled,
+        the fixture ended as asked.
+        """
+        failure = _failure(self.ready) if self.ready.done() else None
+        return None if isinstance(failure, StopAsyncIteration) else failure
+
+    def teardown_failure(self) -> BaseException | None:
+        """What the teardown raised, if anything."""
+        return self._teardown.failure()
 
     def request_teardown(self) -> None:
         self._action.set_result(_TeardownAction.FINISH)
@@ -467,12 +489,10 @@ class FixtureTask(Generic[_T]):
         if self._reported:
             return
         self._reported = True
-        if self.ready.done():
-            setup_failure = _failure(self.ready)
-            if setup_failure is not None:
-                _report_unobserved(task, setup_failure)
-                return
-        self._teardown.report_unobserved(task)
+        if self.yielded:
+            self._teardown.report_unobserved(task)
+        elif (failure := self.setup_failure()) is not None:
+            _report_unobserved(task, failure)
 
     async def _live(self) -> None:
         try:

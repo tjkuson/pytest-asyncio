@@ -120,7 +120,7 @@ pytest still decides when each fixture is torn down, in its usual order, and rep
 
 If a task in the group fails while the fixture is in use, the group cancels the fixture's task, which is waiting at the ``yield``.
 pytest-asyncio then cancels the test or fixture setup running at the time and stops accepting new tests and fixture setups on that event loop; fixture teardowns still run, so that the group exits and reports what happened.
-With the default function-scoped loop, nothing else would have run on the loop.
+With the default function-scoped loop, no later test shares the loop.
 With a wider loop scope, the remaining tests sharing the loop are refused, because pytest-asyncio does not know which of them depend on the failed fixture.
 
 pytest-asyncio manages internal tasks that may appear in ``asyncio.all_tasks()``.
@@ -144,7 +144,9 @@ A copy of a context shares the objects its variables refer to: only the bindings
 Interruption
 ------------
 
-When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels its task, as ``asyncio.Runner`` does, and waits for the coroutine to finish, so that ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
-A second interruption stops the wait: the task is cancelled again and left to finish on its own, and an exception it raises after that is reported through the event loop's exception handler rather than to pytest.
-pytest-asyncio keeps such a task until it finishes; one still unfinished when the loop closes is cancelled once more and waited for.
+When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels its task and waits for the coroutine to finish, as ``asyncio.Runner`` does.
+The wait lets ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
+A fixture interrupted during its setup that yields all the same is torn down at once, since pytest will not tear it down.
+A second interruption is pytest-asyncio's escape from a cleanup that does not finish: the task is cancelled again and left to finish on its own, and an exception it raises after that is reported through the event loop's exception handler rather than to pytest.
+pytest-asyncio keeps such a task until it finishes; one still unfinished when the loop closes is cancelled once more and waited for, which a cleanup that ignores cancellation can still outlast.
 pytest decides, as for any interrupted test, whether the session goes on.

@@ -29,9 +29,11 @@ Examples:
 Cancellation and errors
 -----------------------
 
-When an async generator fixture is cancelled while it waits at its ``yield``, for example by a task group spanning the ``yield`` whose child failed, the test or fixture setup running at the time is cancelled: the test fails with ``asyncio.CancelledError``, with a note explaining the cause on Python 3.11 and later; a fixture setup or teardown errors with ``PytestAsyncioError``, so that pytest caches and reports it like any other fixture error.
+When an async generator fixture is cancelled while it waits at its ``yield``, for example by a task group spanning the ``yield`` whose child failed, the test or fixture setup running at the time is cancelled.
+A test cancelled that way fails with ``asyncio.CancelledError``, with a note explaining the cause on Python 3.11 and later.
+A fixture setup or teardown that a cancellation escapes errors with ``PytestAsyncioError``, so that pytest caches and reports it like any other fixture error.
+The fixture cancelled at its ``yield`` itself reports whatever its teardown raises: a task group spanning the ``yield`` reports its children's errors, as it does anywhere; a cancel scope may exit without an error.
 A test or fixture setup that cannot start because the event loop no longer accepts new work fails with ``RuntimeError``.
-A task group spanning the ``yield`` reports its children's errors at the fixture's teardown, as it reports them anywhere.
 
 Limitations:
 

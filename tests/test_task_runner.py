@@ -102,7 +102,7 @@ def test_a_generator_fixture_lives_in_one_task_across_its_yield():
 
     with TaskRunner() as runner:
         started = _start(runner, fixture(), name="fixture")
-        assert started.setup.value == "value"
+        assert started.setup_result().value == "value"
         assert started.task.get_name() == "fixture"
         runner.finish_fixture(started)
     assert len(tasks) == 2
@@ -199,7 +199,7 @@ def test_a_fixture_keeps_its_context_from_setup_to_teardown():
 
     with TaskRunner() as runner:
         started = _start(runner, fixture())
-        assert started.setup.context[_var] == "from fixture"
+        assert started.setup_result().context[_var] == "from fixture"
         assert _run(runner, _get()) == "unset"
         runner.finish_fixture(started)
     assert seen == ["from fixture", "unset"]
@@ -288,15 +288,17 @@ def test_a_fixture_cancelled_at_its_yield_ends_the_normal_work_of_the_loop(
     with TaskRunner() as runner:
         started = _start(runner, fixture())
         if when == "during a teardown":
-            runner.finish_fixture(_start(runner, teardown(started.setup.value)))
+            runner.finish_fixture(
+                _start(runner, teardown(started.setup_result().value))
+            )
             assert log == ["teardown completed"]
         elif when == "during a test":
             with pytest.raises(asyncio.CancelledError):
-                _run(runner, test(started.setup.value))
+                _run(runner, test(started.setup_result().value))
             assert log == ["test cleaned up"]
         else:
             with pytest.raises(asyncio.CancelledError):
-                _start(runner, setup(started.setup.value))
+                _start(runner, setup(started.setup_result().value))
             assert log == ["setup cleaned up"]
         _assert_teardown_only(runner)
         with pytest.raises(_BaseExceptionGroup) as info:
@@ -336,7 +338,7 @@ def test_a_dependent_fixture_is_torn_down_in_its_own_task_untouched():
         started = _start(runner, service())
         depends = _start(runner, dependent())
         with pytest.raises(asyncio.CancelledError):
-            _run(runner, test(started.setup.value))
+            _run(runner, test(started.setup_result().value))
         runner.finish_fixture(depends)
         assert log == ["dependent cleaned up"]
         with pytest.raises(_BaseExceptionGroup):
@@ -497,27 +499,25 @@ def test_interruption_before_the_fixture_task_started_fails_its_setup():
         _run(runner, _nothing())
 
 
-def test_a_fixture_interrupted_after_its_yield_is_still_owned():
+def test_a_fixture_interrupted_after_its_yield_is_torn_down_at_once():
     """
-    An interruption of the wait for the setup after the fixture yielded: the
-    fixture's task is alive and owned, so the runner closes the fixture in
-    its task at loop close instead of leaving it waiting forever.
+    An interruption of the wait for the setup after the fixture yielded:
+    pytest never receives the fixture, so the runner tears it down in its
+    task before the setup call raises, as pytest would have later.
     """
     log = []
 
     async def fixture() -> AsyncGenerator[None]:
         _interrupt(asyncio.get_running_loop())
-        try:
-            yield
-        finally:
-            await asyncio.sleep(0)
-            log.append("closed in its task" if _task().get_name() == "f" else "?")
+        yield
+        await asyncio.sleep(0)
+        log.append("torn down in its task" if _task().get_name() == "f" else "?")
 
     with TaskRunner() as runner:
         with pytest.raises(KeyboardInterrupt):
             _start(runner, fixture(), name="f")
+        assert log == ["torn down in its task"]
         _run(runner, _nothing())
-    assert log == ["closed in its task"]
 
 
 def test_an_abandoned_fixture_teardown_reports_its_late_error():
@@ -593,7 +593,7 @@ def test_close_finalises_a_fixture_cancelled_at_its_yield():
     with TaskRunner() as runner:
         runner.get_loop().set_exception_handler(lambda loop, ctx: reported.append(ctx))
         started = _start(runner, fixture())
-        started.setup.value.set()
+        started.setup_result().value.set()
         with pytest.raises(asyncio.CancelledError):
             _run(runner, asyncio.Event().wait(), name="cancelled as the child fails")
         _assert_teardown_only(runner)
@@ -927,7 +927,7 @@ def test_a_cancellation_at_the_end_of_a_fixture_teardown_is_its_outcome():
 
     with TaskRunner() as runner:
         started = _start(runner, fixture())
-        assert started.setup.value == "ready"
+        assert started.setup_result().value == "ready"
         with pytest.raises(asyncio.CancelledError):
             runner.finish_fixture(started)
         assert started.task.cancelled()

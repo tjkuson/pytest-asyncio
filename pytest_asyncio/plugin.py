@@ -440,7 +440,8 @@ def _wrap_asyncgen_fixture(
         except asyncio.CancelledError as exc:
             raise _cancelled_fixture_error("setup", runner) from exc
 
-        reset_contextvars = _apply_contextvar_changes(context, fixture.setup.context)
+        setup = fixture.setup_result()
+        reset_contextvars = _apply_contextvar_changes(context, setup.context)
 
         def finalizer() -> None:
             try:
@@ -452,7 +453,7 @@ def _wrap_asyncgen_fixture(
                     reset_contextvars()
 
         request.addfinalizer(finalizer)
-        return fixture.setup.value
+        return setup.value
 
     return _asyncgen_fixture_wrapper
 
