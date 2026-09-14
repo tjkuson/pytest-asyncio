@@ -34,7 +34,7 @@ _LIBRARIES = [pytest.param("asyncio", marks=_REQUIRES_311), "anyio"]
 _CANCELLED = ["*asyncio.exceptions.CancelledError*"]
 if sys.version_info >= (3, 11):
     _CANCELLED.append("*A task of pytest-asyncio's on this event loop was cancelled: *")
-_REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed.*"
+_REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 
 
 def _fixture_cancelled(phase: str) -> list[str]:
@@ -538,7 +538,7 @@ def test_two_task_group_fixtures(pytester: Pytester, failing: str):
     ("body", "passed", "error"),
     [
         ("return; yield", 1, "*StopAsyncIteration*"),
-        ("yield; yield", 2, "*ValueError: Async generator fixture didn't stop.*"),
+        ("yield; yield", 2, "*ValueError: Async generator fixture yielded more than*"),
     ],
     ids=["never_yields", "yields_twice"],
 )
@@ -759,4 +759,6 @@ def test_sync_tests_and_fixtures_with_async_fixtures(pytester: Pytester):
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=2, failed=1)
-    result.stdout.fnmatch_lines(["*cannot be requested from a running event loop*"])
+    result.stdout.fnmatch_lines(
+        ["*cannot start an async fixture or test while the event loop is running*"]
+    )

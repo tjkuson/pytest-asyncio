@@ -7,9 +7,8 @@ else: the later tests on the loop run. The exception is an async generator
 fixture's task cancelled as it waits at its yield, by a task group, cancel
 scope or timeout spanning the yield or by a test cancelling every task: the
 loop then runs nothing but fixture teardowns until it closes. A refused test
-fails with CancelledError; a refused fixture setup errors with
-PytestAsyncioError, the refusal as its cause. A function-scoped loop closes
-right after its test.
+fails, and a refused fixture setup errors, with a RuntimeError. A
+function-scoped loop closes right after its test.
 """
 
 from __future__ import annotations
@@ -20,12 +19,9 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-_REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed."
-# pytest prints the cause of a fixture's PytestAsyncioError first.
-_REFUSED_SETUP = [
-    _REFUSED,
-    "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
-]
+_REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
+# A refused fixture setup is the same RuntimeError, an ordinary fixture error.
+_REFUSED_SETUP = [_REFUSED]
 _NEEDS_TASK_GROUP = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
 )
@@ -218,7 +214,7 @@ def test_loop_whose_task_factory_cancels_the_first_task(
     if cancel == "task.cancel()":
         result.assert_outcomes(errors=2)
         result.stdout.fnmatch_lines(
-            ["*PytestAsyncioError: pytest-asyncio could not open this event loop: *"]
+            ["*PytestAsyncioError: The initialization of pytest-asyncio*cancelled.*"]
         )
     else:
         result.assert_outcomes(errors=1, failed=1)
@@ -492,7 +488,7 @@ def test_sync_test_closes_the_shared_loop(pytester: Pytester):
     result.stdout.fnmatch_lines(
         [
             "*RuntimeError: Event loop is closed*",
-            "*An exception occurred during teardown of an asyncio.Runner*",
+            "*An exception occurred while pytest-asyncio closed the event loop*",
         ]
     )
 

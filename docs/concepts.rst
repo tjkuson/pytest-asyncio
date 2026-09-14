@@ -106,46 +106,38 @@ This sequential execution is intentional and important for maintaining test isol
 
 .. _concepts/tasks:
 
-Tasks, cancellation and context
-===============================
+Fixture tasks and cancellation
+==============================
 
 pytest-asyncio runs each async fixture and each test in an asyncio task of its own.
 The task of an async generator fixture stays alive across the fixture's ``yield``: it runs the setup, waits while the fixture is in use, and runs the teardown.
-The task that enters a task group, cancel scope or timeout before the ``yield`` is therefore the task that exits it, so a fixture can wrap its ``yield`` in an ``asyncio.TaskGroup``, an ``asyncio.timeout``, or the cancel scope of a library such as AnyIO, and background tasks run for as long as the fixture is alive:
+The task that enters a task group, cancel scope or timeout before the ``yield`` is therefore the task that exits it, as those constructs require, so a fixture can run background tasks for as long as it is alive:
 
 .. include:: concepts_task_group_fixture_example.py
     :code: python
 
-A fixture's errors go to pytest, at the setup or teardown of that fixture, and pytest tears fixtures down in its usual order.
+pytest still decides when each fixture is torn down, in its usual order, and reports a fixture's own errors at its setup or teardown.
+
+If a task in the group fails while the fixture is in use, the group cancels the fixture's task, which is waiting at the ``yield``.
+pytest-asyncio then cancels the test or fixture setup running at the time and stops accepting new tests and fixture setups on that event loop; fixture teardowns still run, so that the group exits and reports what happened.
+With the default function-scoped loop, nothing else would have run on the loop.
+With a wider loop scope, the remaining tests sharing the loop are refused, because pytest-asyncio does not know which of them depend on the failed fixture.
 
 pytest-asyncio manages internal tasks that may appear in ``asyncio.all_tasks()``.
 These tasks are not part of pytest-asyncio's public API, and their names, number and arrangement may change between releases.
 
-Cancellation
-------------
-
-If a task in the group fails, the group cancels the fixture's task, which is waiting at the ``yield``.
-pytest-asyncio then cancels the test or fixture setup running at the time, which fails with ``asyncio.CancelledError``, and ends the normal work of that event loop: fixture teardowns still run, so that the group can exit and report what happened, but further tests and fixture setups in the loop are refused.
-A refused test fails with an ``asyncio.CancelledError`` explaining the refusal; a refused or cancelled fixture setup or teardown errors with a ``PytestAsyncioError`` carrying the cause, so that pytest handles it like any other fixture error.
-The group raises the failure as an ``ExceptionGroup`` when the fixture is torn down, which pytest reports as an error at teardown of that fixture.
-
-With the default function-scoped loop, nothing else would have run in the loop anyway.
-With a wider loop scope, the remaining tests sharing the loop are refused: pytest-asyncio does not know which of them depend on the failed fixture.
-A cancellation of one of pytest-asyncio's internal tasks ends the normal work of the loop in the same way.
-
-The teardown of a fixture that depends on the failed one runs in its own task, outside the failed fixture's scope, so that scope does not cancel it.
-Until the failed fixture's own teardown exits the scope, an AnyIO cancel scope keeps re-cancelling the fixture's waiting task, which costs CPU time for as long as the dependent fixtures' cleanup takes: a substantial share of one core, varying with the machine and the Python version.
+The exact exceptions reported, and the limitations of cancellation across a ``yield``, are listed with the :ref:`fixture decorator <decorators/pytest_asyncio_fixture/cancellation>`.
 
 Context variables
 -----------------
 
-Each async fixture and each test runs in its own copy of the context (``contextvars``) of the synchronous pytest code that requested it, as it did before:
+Each async fixture and each test runs in its own copy of the context (``contextvars``) of the synchronous pytest code that requested it:
 
 * Variables set by synchronous fixtures and tests are seen by the async fixtures and tests that follow.
-* Variables set by an async fixture are seen by the synchronous fixtures and tests depending on it, and by later async code, until the fixture is torn down.
+* Variables set by an async fixture during its setup are seen by the synchronous fixtures and tests depending on it, and by later async code, until the fixture is torn down.
   The setup and teardown of an async fixture run in the same task and context, so a fixture can reset after its ``yield`` a variable it set before.
 * Variables set by an async test are seen by no later fixture or test, whatever the loop scope of the test.
-  Tasks and callbacks started by a fixture or test inherit its context, as always in asyncio.
+  Tasks and callbacks started by a fixture or test inherit its context by default, as in any asyncio program.
 
 A copy of a context shares the objects its variables refer to: only the bindings are separate.
 
@@ -153,12 +145,6 @@ Interruption
 ------------
 
 When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels its task, as ``asyncio.Runner`` does, and waits for the coroutine to finish, so that ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
-A second interruption abandons the coroutine: its task is cancelled again and left to end on its own, and an error it ended or ends with is reported through the event loop's exception handler (pytest's logging capture shows it with live logging).
-pytest-asyncio keeps the task until the loop closes, where asyncio cancels it once more and waits for it, so its cleanup still runs unless it ignores cancellation.
-Other fixtures and tests are unaffected.
-
-Limitations
------------
-
-* A timeout spanning a ``yield`` that expires while a test runs cancels the fixture's task, and with it the test; it does not raise ``TimeoutError`` at teardown, because the fixture's teardown exits the timeout without an exception.
-* A cancellation that reaches a fixture's task at its ``yield`` ends the normal work of the whole loop, including for tests that do not use that fixture.
+A second interruption stops the wait: the task is cancelled again and left to finish on its own, and an exception it raises after that is reported through the event loop's exception handler rather than to pytest.
+pytest-asyncio keeps such a task until it finishes; one still unfinished when the loop closes is cancelled once more and waited for.
+pytest decides, as for any interrupted test, whether the session goes on.

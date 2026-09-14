@@ -58,7 +58,7 @@ def test_the_runner_closes_however_its_scope_ends(exit_with):
 def test_a_failed_opening_is_a_fixture_error_and_opens_nothing():
     loop_factory, loops = _loop_factory(lambda loop, task: task.cancel())
     with (
-        pytest.raises(PytestAsyncioError, match="could not open this event loop"),
+        pytest.raises(PytestAsyncioError, match="initialization of pytest-asyncio"),
         _opened(TaskRunner(loop_factory=loop_factory)),
     ):
         pytest.fail("the runner opened")

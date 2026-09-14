@@ -326,12 +326,10 @@ def pytest_report_header(config: Config) -> list[str]:
     ]
 
 
-_CANCELLED_NOTE = """\
-A task of pytest-asyncio's on this event loop was cancelled: only fixture \
-teardowns run on it until it closes. If a task group, cancel scope or timeout \
-spanning the yield of a fixture requested the cancellation, the error that \
-caused it is reported when that fixture is torn down.\
-"""
+_CANCELLED_NOTE = (
+    "A task of pytest-asyncio's on this event loop was cancelled: fixture "
+    "teardowns still run on it, but no new tests or fixture setups."
+)
 
 _T = TypeVar("_T")
 
@@ -342,7 +340,6 @@ def _run_test(
     context: contextvars.Context,
     name: str,
 ) -> _T:
-    """Run a test coroutine, explaining a cancellation that ended the loop's work."""
     try:
         return runner.run(coro, context=context, name=name)
     except asyncio.CancelledError as exc:
@@ -351,20 +348,10 @@ def _run_test(
         raise
 
 
-_OPENING_CANCELLED_MESSAGE = (
-    "pytest-asyncio could not open this event loop: its task on the loop was "
-    "cancelled before it started. No async fixture or test runs on the loop."
-)
-
-
 def _cancelled_fixture_error(phase: str, runner: TaskRunner) -> PytestAsyncioError:
-    """
-    The error reported for a cancelled setup or teardown of an async fixture.
-
-    An Exception rather than the CancelledError: pytest caches the error of a
-    fixture's setup for the fixture's other users, and carries on with the
-    remaining finalizers of a node after a failed teardown, only for one.
-    """
+    # pytest caches a fixture's setup error for its other users, and goes on
+    # with a node's other finalizers after a teardown error, only if the
+    # error is an Exception; a CancelledError is not.
     msg = f"The {phase} of the async fixture was cancelled."
     if runner.teardown_only:
         msg += " " + _CANCELLED_NOTE
@@ -452,11 +439,9 @@ def _wrap_asyncgen_fixture(
         except asyncio.CancelledError as exc:
             raise _cancelled_fixture_error("setup", runner) from exc
 
-        assert fixture.context_after is not None
-        reset_contextvars = _apply_contextvar_changes(context, fixture.context_after)
+        reset_contextvars = _apply_contextvar_changes(context, fixture.setup.context)
 
         def finalizer() -> None:
-            """Yield again, to finalize."""
             try:
                 runner.finish_fixture(fixture)
             except asyncio.CancelledError as exc:
@@ -466,7 +451,7 @@ def _wrap_asyncgen_fixture(
                     reset_contextvars()
 
         request.addfinalizer(finalizer)
-        return fixture.value
+        return fixture.setup.value
 
     return _asyncgen_fixture_wrapper
 
@@ -523,14 +508,12 @@ def _apply_contextvar_changes(
     Copy the contextvars a fixture changed into the current context.
 
     ``before`` is the context the fixture's task was created from, ``after``
-    a copy of the task's context once the fixture was set up. If any
-    contextvars were modified by the fixture (or supplied to its task),
-    return a finalizer that will restore them.
+    a copy of the task's context once the fixture was set up. If the fixture
+    (or its task's factory) changed any, return a finalizer restoring them.
     """
     context_tokens = []
     for var, value in after.items():
         if var in before and before[var] is value:
-            # This variable is not modified, so leave it as-is.
             continue
         token = var.set(value)
         context_tokens.append((var, token))
@@ -1052,13 +1035,10 @@ def _get_default_test_loop_scope(config: Config) -> Any:
 
 
 _RUNNER_TEARDOWN_WARNING = """\
-An exception occurred during teardown of an asyncio.Runner. \
-The reason is likely that you closed the underlying event loop in a test, \
-which prevents the cleanup of asynchronous generators by the runner.
-This warning will become an error in future versions of pytest-asyncio. \
-Please ensure that your tests don't close the event loop. \
-Here is the traceback of the exception triggered during teardown:
-%s
+An exception occurred while pytest-asyncio closed the event loop of a scope \
+(was the loop closed by a test?). This warning will become an error in a \
+future version of pytest-asyncio. The traceback of the exception:
+%s\
 """
 
 
@@ -1067,15 +1047,15 @@ def _opened(runner: TaskRunner) -> Iterator[TaskRunner]:
     """
     The runner, open.
 
-    A failed opening is an ordinary fixture error, which pytest reports for
-    every test of the scope. An error closing the runner, most likely
-    because a test closed the loop, is reported as a warning (see
-    _RUNNER_TEARDOWN_WARNING).
+    A cancelled opening is an ordinary fixture error, which pytest reports
+    for every test of the scope; an error closing the runner is a warning
+    (see _RUNNER_TEARDOWN_WARNING).
     """
     try:
         runner.open()
     except asyncio.CancelledError as exc:
-        raise PytestAsyncioError(_OPENING_CANCELLED_MESSAGE) from exc
+        msg = "The initialization of pytest-asyncio's event loop runner was cancelled."
+        raise PytestAsyncioError(msg) from exc
     try:
         yield runner
     finally:

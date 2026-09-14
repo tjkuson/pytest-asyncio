@@ -21,7 +21,7 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-_REFUSED = "*CancelledError: The coroutine was refused: *until the loop is closed."
+_REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 _SIGNALS = pytest.mark.skipif(sys.platform == "win32", reason="SIGINT and SIGALRM")
 _NEEDS_TASK_GROUP = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
@@ -175,7 +175,7 @@ def test_second_interruption_abandons_hung_cleanup(pytester: Pytester, then: str
     else:
         result.stdout.fnmatch_lines(
             [
-                "*Exception from a fixture or test that pytest-asyncio abandoned *",
+                "*Exception from an async fixture or test after pytest stopped*",
                 "*RuntimeError: abandoned cleanup failed",
             ]
         )
@@ -522,11 +522,11 @@ def test_error_of_a_teardown_settled_just_before_its_abandonment_is_reported(
     assert result.ret == pytest.ExitCode.INTERRUPTED
     out = result.stdout.str()
     err = result.stderr.str()
-    assert out.count("pytest-asyncio abandoned after a second interruption") == 1
+    assert out.count("after pytest stopped waiting for it") == 1
     result.stdout.fnmatch_lines(
         [
             "*TEARDOWN RAISES*",
-            "*Exception from a fixture or test that pytest-asyncio abandoned *",
+            "*Exception from an async fixture or test after pytest stopped waiting*",
             "*ValueError: teardown failed as the second interruption arrived",
             "*KeyboardInterrupt*",
         ]
