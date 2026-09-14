@@ -146,7 +146,7 @@ Interruption
 
 When a test or fixture is interrupted, for example by Ctrl-C or by the signal of a timeout plugin, pytest-asyncio cancels its task and waits for the coroutine to finish, as ``asyncio.Runner`` does.
 The wait lets ``finally`` blocks and async context managers run before pytest tears down the fixtures the coroutine may be using.
-A fixture interrupted during its setup that yields all the same is torn down at once, since pytest will not tear it down.
-A second interruption is pytest-asyncio's escape from a cleanup that does not finish: the task is cancelled again and left to finish on its own, and an exception it raises after that is reported through the event loop's exception handler rather than to pytest.
-pytest-asyncio keeps such a task until it finishes; one still unfinished when the loop closes is cancelled once more and waited for, which a cleanup that ignores cancellation can still outlast.
+A fixture interrupted during its setup that recovers and yields is torn down at once, since pytest will not receive it.
+A second interruption stops waiting for the current test or fixture: its task is cancelled again and left to finish on its own, and an exception it raises after that is reported through the event loop's exception handler rather than to pytest.
+Closing the loop still waits for every task it started, after cancelling them once more, so a cleanup that keeps suppressing cancellation prevents the loop from closing.
 pytest decides, as for any interrupted test, whether the session goes on.

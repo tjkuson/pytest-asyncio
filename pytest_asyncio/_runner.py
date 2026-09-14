@@ -8,6 +8,16 @@ until that work is done and reads its result: a fixture's setup is ready
 while its task lives on; a test, and a fixture's teardown, are done when
 their task is. Closing the scope finishes the group, which joins its
 tasks, and closes the loop.
+
+Two policies decide the exceptional paths. A cancellation reaching a
+fixture as it waits at its yield (from a task group spanning the yield
+whose child failed, say) ends the loop's normal work: the test or setup
+running at the time is cancelled, and only teardowns run until the loop
+closes. An interruption of a synchronous call (SIGINT, or a callback
+raising) cancels the task waited for and waits for it to end, so that it
+cleans up before pytest tears down the fixtures it uses; what the cleanup
+raised is raised instead of the interruption, as asyncio.Runner does. A
+second interruption stops waiting.
 """
 
 from __future__ import annotations
@@ -17,7 +27,7 @@ import contextlib
 import contextvars
 import enum
 import sys
-from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -42,21 +52,7 @@ _NESTED_MESSAGE = (
 
 
 class TaskRunner:
-    """
-    The event loop scope: a loop driver, and the task group of its tasks.
-
-    The loop refuses new tests and fixture setups once an async generator
-    fixture was cancelled while it waited at its ``yield`` (by a task group
-    whose child failed, say), or the runner's own task was: the test or
-    setup running at the time is cancelled, and only teardowns run until
-    the loop closes (see FixtureTask, and _stop_normal_work).
-
-    An interruption of a wait (SIGINT, or a callback raising) cancels the
-    task waited for and waits for it to end, so that it cleans up before
-    pytest tears down the fixtures it may use, and raises what the cleanup
-    raised instead of the interruption, as asyncio.Runner does. A second
-    interruption stops waiting (see _join_or_abandon).
-    """
+    """The event loop scope: a loop driver, and the task group of its tasks."""
 
     def __init__(
         self,
@@ -126,7 +122,8 @@ class TaskRunner:
                 return captured.read(task)
             task.cancel()
             self._join_or_abandon(task, captured.report_unobserved)
-            raise captured.failure() or interruption
+            failure = captured.failure()
+            raise interruption if failure is None else failure
 
     def start_fixture(
         self,
@@ -152,17 +149,19 @@ class TaskRunner:
             if not fixture.ready.done():
                 fixture.task.cancel()
                 self._join_or_abandon(
-                    fixture.task, fixture.report_unobserved, fixture.ready
+                    fixture.task, fixture.report_unobserved, ready=fixture.ready
                 )
         # Interrupted, the fixture is not handed to pytest, which will not
         # tear it down: it ends here, before pytest tears down the fixtures
-        # it depends on. One that yielded all the same is torn down, as
+        # it depends on. One that recovered and yielded is torn down, as
         # pytest would have.
         if fixture.yielded:
             fixture.request_teardown()
             self._join_or_abandon(fixture.task, fixture.report_unobserved)
-            raise fixture.teardown_failure() or interruption
-        raise fixture.setup_failure() or interruption
+            failure = fixture.teardown_failure()
+        else:
+            failure = fixture.interrupted_setup_failure()
+        raise interruption if failure is None else failure
 
     def finish_fixture(self, fixture: FixtureTask[Any]) -> None:
         """Run the fixture from its yield to its end, in its task."""
@@ -173,7 +172,8 @@ class TaskRunner:
             return
         fixture.task.cancel()
         self._join_or_abandon(fixture.task, fixture.report_unobserved)
-        raise fixture.teardown_failure() or interruption
+        failure = fixture.teardown_failure()
+        raise interruption if failure is None else failure
 
     def _admit(self, work: Coroutine[Any, Any, Any] | AsyncGenerator[Any]) -> None:
         """Refuse new work before it has a task, or a place as the active one."""
@@ -185,7 +185,7 @@ class TaskRunner:
             raise RuntimeError(REFUSED_MESSAGE)
 
     @contextlib.contextmanager
-    def _as_active(self, task: asyncio.Task[object]) -> Iterator[None]:
+    def _as_active(self, task: asyncio.Task[object]) -> Generator[None]:
         """The test or setup pytest waits for, cancelled by _stop_normal_work."""
         self._active = task
         try:
@@ -197,16 +197,21 @@ class TaskRunner:
         self,
         task: asyncio.Task[object],
         unobserved: Callable[[asyncio.Task[object]], None],
-        *also: asyncio.Future[Any],
+        *,
+        ready: asyncio.Future[Any] | None = None,
     ) -> None:
         """
-        Drive the loop until the task ends, or one of the other futures is done.
+        Drive the loop until the cancelled task ends.
 
         A second interruption stops waiting: the task is cancelled again and
         left to end on its own, ``unobserved`` reports what it ends with, and
-        close cancels it once more.
+        close cancels it once more. A setup's ``ready`` also ends the wait:
+        a cancelled setup that recovers and yields parks its task there.
         """
-        interruption = self._drive_until(task, *also)
+        waiters: list[asyncio.Future[Any]] = [task]
+        if ready is not None:
+            waiters.append(ready)
+        interruption = self._drive_until(*waiters)
         if interruption is not None:
             task.add_done_callback(unobserved)
             task.cancel()
@@ -241,15 +246,12 @@ if sys.version_info >= (3, 11):
 
     class _TaskGroupHost:
         """
-        A task of the runner's own that keeps a task group entered.
-
-        The host enters an :class:`asyncio.TaskGroup` when the runner opens
-        and exits it at :meth:`finish`; the fixtures' and tests' tasks are
-        its children, so the group joins them. A child only ends with an
-        exception if the runner has a bug (see _Captured and FixtureTask),
-        and the group raises it at finish. A cancellation of the host stops
-        the loop's normal work; the group then cancels its children and waits
-        for them, as any task group does.
+        A task of the runner's own, ``pytest-asyncio``, keeping a task group
+        entered from :meth:`start` to :meth:`finish`, so that the fixtures'
+        and tests' tasks are its children. A child only ends with an
+        exception if the runner has a bug (see _Captured and FixtureTask);
+        the group raises it at finish. A cancellation of the host stops the
+        loop's normal work, then cancels the children, as in any group.
         """
 
         @classmethod
@@ -417,16 +419,9 @@ class FixtureTask(Generic[_T]):
 
     The task runs the setup, announces its result (:attr:`ready`), waits at
     the ``yield`` for pytest's request, then runs the teardown or closes the
-    generator. Setup and teardown therefore share a task and a context, and
-    a task group, cancel scope or timeout entered before the ``yield`` is
-    exited by its own task. The setup is read while the task lives; the
-    teardown is read once the task has ended.
-
-    A cancellation of the task while it waits is consumed there: it stops
-    the loop's normal work (``stop_normal_work``) and the task keeps
-    waiting, so that pytest tears the fixtures down in its order and this
-    fixture's teardown is what exits the scope. The cancellation is not
-    replayed into the generator.
+    generator: a task group, cancel scope or timeout entered before the
+    ``yield`` is exited by the task that entered it. The setup is read while
+    the task lives; the teardown once the task has ended.
     """
 
     def __init__(
@@ -457,12 +452,15 @@ class FixtureTask(Generic[_T]):
         """The setup reached the yield: the task waits there, or tears down."""
         return self.ready.done() and self.ready.exception() is None
 
-    def setup_failure(self) -> BaseException | None:
+    def interrupted_setup_failure(self) -> BaseException | None:
         """
-        What the setup raised, if an error.
+        What an interrupted setup raised, if a user error.
 
-        A cancellation is none, nor is a return before the yield: cancelled,
-        the fixture ended as asked.
+        Interrupted, a setup that ends without yielding gives pytest the
+        interruption: not the generator's StopAsyncIteration, whether it
+        returned after the cancellation or before it arrived, and not the
+        cancellation, which is the interruption's own. Only the setup that
+        pytest reads (:meth:`setup_result`) requires a yield.
         """
         failure = _failure(self.ready) if self.ready.done() else None
         return None if isinstance(failure, StopAsyncIteration) else failure
@@ -491,7 +489,7 @@ class FixtureTask(Generic[_T]):
         self._reported = True
         if self.yielded:
             self._teardown.report_unobserved(task)
-        elif (failure := self.setup_failure()) is not None:
+        elif (failure := self.interrupted_setup_failure()) is not None:
             _report_unobserved(task, failure)
 
     async def _live(self) -> None:
@@ -505,8 +503,10 @@ class FixtureTask(Generic[_T]):
             try:
                 await asyncio.wait([self._action])
             except asyncio.CancelledError:
-                # Keep waiting: dependent fixtures are torn down first, and
-                # this fixture's teardown, in this task, exits the scope.
+                # A cancellation at the yield (a task group's, say) is
+                # consumed here, not replayed into the generator: the task
+                # keeps waiting, so that pytest tears the fixtures down in
+                # its order and this fixture's teardown exits the scope.
                 self._stop_normal_work()
         await self._teardown.run(self._tear_down(self._action.result()))
 

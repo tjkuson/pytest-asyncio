@@ -1,16 +1,12 @@
 """
 Interrupting the wait for a test or a fixture.
 
-``Runner.run`` raises on the first SIGINT, when a KeyboardInterrupt or a
-pytest-timeout failure escapes the event loop, or when the loop is stopped.
-The runner then cancels the task it was waiting for, as asyncio.Runner
-cancels its main task, drives the loop until that task has ended and
-re-raises: the cleanup of the test or fixture completes before pytest tears
-anything down, and finds the request on its task like any other
-cancellation. The interruption reaches that task alone, and the loop goes
-on serving the other tests of its scope, which shows after a stopped loop,
-a pytest-timeout signal or a cleanup failure; Ctrl-C ends the session
-anyway.
+Ctrl-C, a callback raising KeyboardInterrupt, a timeout plugin's failure or a
+stopped event loop interrupts pytest-asyncio's wait for the running test or
+fixture. pytest-asyncio cancels that task and waits for it to end, so that
+its cleanup completes before pytest tears down the fixtures it uses; what
+the cleanup raises is reported instead of the interruption. A second
+interruption stops waiting.
 """
 
 from __future__ import annotations
@@ -21,438 +17,473 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
+_POSIX = pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
+_REQUIRES_311 = pytest.mark.skipif(sys.version_info < (3, 11), reason="needs 3.11")
 _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
-_SIGNALS = pytest.mark.skipif(sys.platform == "win32", reason="SIGINT and SIGALRM")
-_NEEDS_TASK_GROUP = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="asyncio.TaskGroup needs Python 3.11"
-)
+_REPORTED_LATE = "Exception from an async fixture or test after pytest stopped waiting"
 
+# The fixtures and tests of an example append to ``events``; the conftest
+# writes them to a file once every fixture is torn down, so that the outer
+# test reads what ran, and in which order, instead of matching output that a
+# traceback may repeat.
+_EVENTS_CONFTEST = """\
+    from pathlib import Path
 
-def _run(pytester: Pytester, source: str, *args: str):
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent(source))
-    return pytester.runpytest_subprocess(
-        "--asyncio-mode=strict", "-s", *args, timeout=30
-    )
-
-
-def _assert_ordered(out: str, *events: str) -> None:
-    positions = [out.index(event) for event in events]
-    assert positions == sorted(positions), events
-
-
-# The interruption arrives while the test awaits; what the test does about it
-# varies.
-_INTERRUPTED_TEST_SOURCE = """
-    import asyncio
-    import os
-    import signal
     import pytest
-    import pytest_asyncio
 
-    def sigint():
-        asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGINT)
+    events = []
 
-    def raise_():
-        raise KeyboardInterrupt
-
-    @pytest.fixture(scope="module")
-    def resource():
-        state = {{"open": True}}
-        yield state
-        print("SYNC TEARDOWN")
-        state["open"] = False
-
-    @pytest_asyncio.fixture(loop_scope="module")
-    async def async_resource(resource):
-        yield resource
-        await asyncio.sleep(0)
-        print("ASYNC TEARDOWN")
-
-    async def finish(resource):
-        await asyncio.sleep(0.05)
-        assert resource["open"]
-        print("CLEANUP FINISHED")
-
-    async def hang():
-        sigint()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            print("HUNG CLEANUP ENDED")
-            {then}
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_interrupted(async_resource):
-        try:
-            {interrupt}
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            print("TEST CANCELLED")
-            {on_cancel}
-        finally:
-            print("CLEANUP STARTED")
-            {cleanup}
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_next():
-        print("NEXT RAN")
-"""
+    @pytest.hookimpl(wrapper=True)
+    def pytest_sessionfinish(session):
+        yield
+        Path(session.config.rootpath, "events.txt").write_text("\\n".join(events))
+    """
 
 
-def _interrupted_test(
-    interrupt: str = "sigint()",
-    on_cancel: str = "raise",
-    cleanup: str = "pass",
-    then: str = "pass",
-) -> str:
-    return _INTERRUPTED_TEST_SOURCE.format(
-        interrupt=interrupt, on_cancel=on_cancel, cleanup=cleanup, then=then
-    )
+def _events(pytester: Pytester) -> list[str]:
+    return (pytester.path / "events.txt").read_text().splitlines()
 
 
-@_SIGNALS
 @pytest.mark.parametrize(
     "interrupt",
     [
-        pytest.param("sigint()", id="sigint"),
+        pytest.param("raise KeyboardInterrupt", id="raised_by_the_test"),
+        pytest.param("loop.call_soon(interrupt)", id="raised_by_a_callback"),
         pytest.param(
-            "asyncio.get_running_loop().call_soon(raise_)",
-            id="keyboard_interrupt_from_callback",
+            "loop.call_soon(os.kill, os.getpid(), signal.SIGINT)",
+            id="sigint",
+            marks=_POSIX,
         ),
-        pytest.param("raise KeyboardInterrupt", id="keyboard_interrupt_from_test"),
     ],
 )
-def test_interrupted_test_cleans_up_before_fixture_teardown(
+def test_an_interrupted_test_finishes_its_cleanup_before_its_fixtures_are_torn_down(
     pytester: Pytester, interrupt: str
 ):
-    """
-    The test's cleanup runs to completion, then the async fixture is torn
-    down, then the sync fixture; the session ends by interruption.
-    """
-    source = _interrupted_test(interrupt, cleanup="await finish(async_resource)")
-    result = _run(pytester, source)
+    """The cleanup of the interrupted test still finds its fixtures open."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent(f"""\
+        import asyncio
+        import os
+        import signal
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.fixture
+        def connection():
+            state = {{"open": True}}
+            yield state
+            state["open"] = False
+            events.append("connection closed")
+
+        @pytest_asyncio.fixture
+        async def transaction(connection):
+            yield connection
+            await asyncio.sleep(0)
+            assert connection["open"]
+            events.append("transaction closed")
+
+        @pytest.mark.asyncio
+        async def test_query(transaction):
+            loop = asyncio.get_running_loop()
+            try:
+                {interrupt}
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                assert transaction["open"]
+                events.append("query cleaned up")
+
+        @pytest.mark.asyncio
+        async def test_next():
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    _assert_ordered(
-        out, "CLEANUP STARTED", "CLEANUP FINISHED", "ASYNC TEARDOWN", "SYNC TEARDOWN"
-    )
-    assert "NEXT RAN" not in out
-    result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
+    assert _events(pytester) == [
+        "query cleaned up",
+        "transaction closed",
+        "connection closed",
+    ]
 
 
-@_SIGNALS
-@pytest.mark.parametrize(
-    "then",
-    [
-        pytest.param("pass", id="ends"),
-        pytest.param("raise RuntimeError('abandoned cleanup failed')", id="fails"),
-    ],
-)
-def test_second_interruption_abandons_hung_cleanup(pytester: Pytester, then: str):
-    """
-    The wait for the cleanup is interrupted too: the interruption reaches
-    pytest at once and the abandoned task ends at its next await, the next
-    time the loop runs (here, for the async fixture's teardown). Nothing is
-    left pending or unawaited; an error the abandoned cleanup ends with goes
-    to the loop's exception handler, which logs it (pytest shows such logs
-    with live logging, as any asyncio error report during an interruption).
-    """
-    source = _interrupted_test(cleanup="await hang()", then=then)
-    result = _run(pytester, source, "-W", "error", "-o", "log_cli=true")
-    assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    _assert_ordered(
-        out, "CLEANUP STARTED", "HUNG CLEANUP ENDED", "ASYNC TEARDOWN", "SYNC TEARDOWN"
+def test_a_second_interruption_stops_waiting_for_the_cleanup(pytester: Pytester):
+    """The abandoned cleanup ends on its own, before the fixtures are torn down."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def connection():
+            yield
+            await asyncio.sleep(0)
+            events.append("connection closed")
+
+        @pytest.mark.asyncio
+        async def test_query(connection):
+            loop = asyncio.get_running_loop()
+            loop.call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                loop.call_soon(interrupt)
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    events.append("cleanup ended")
+                    raise
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
     )
-    assert "NEXT RAN" not in out
-    result.stdout.fnmatch_lines(["*KeyboardInterrupt*"])
-    err = result.stderr.str()
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert _events(pytester) == ["cleanup ended", "connection closed"]
     for noise in ("Task was destroyed", "never awaited", "never retrieved"):
-        assert noise not in out + err
-    if then == "pass":
-        assert "abandoned" not in out + err
-    else:
-        result.stdout.fnmatch_lines(
-            [
-                "*Exception from an async fixture or test after pytest stopped*",
-                "*RuntimeError: abandoned cleanup failed",
-            ]
-        )
+        assert noise not in result.stdout.str() + result.stderr.str()
 
 
-@_SIGNALS
-def test_cleanup_failure_replaces_the_interruption(pytester: Pytester):
-    """
-    As for a synchronous test, the error the test ends with is its outcome:
-    the test fails with it (the cancellation is its context) and the session
-    goes on, the next test on the shared loop included.
-    """
-    source = _interrupted_test(cleanup="raise AssertionError('cleanup bug')")
-    result = _run(pytester, source)
+def test_an_error_raised_after_the_second_interruption_is_reported_once(
+    pytester: Pytester,
+):
+    """The abandoned cleanup's error goes to the loop's exception handler."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def connection():
+            yield
+            await asyncio.sleep(0)
+
+        @pytest.mark.asyncio
+        async def test_query(connection):
+            loop = asyncio.get_running_loop()
+            loop.call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                loop.call_soon(interrupt)
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise RuntimeError("abandoned cleanup failed") from None
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", "-o", "log_cli=true", timeout=30
+    )
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert result.stdout.str().count(_REPORTED_LATE) == 1
+    result.stdout.fnmatch_lines(["*RuntimeError: abandoned cleanup failed*"])
+
+
+def test_a_cleanup_error_is_reported_instead_of_the_interruption(pytester: Pytester):
+    """The test fails with its cleanup's error, and the session goes on."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_query():
+            asyncio.get_running_loop().call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                raise AssertionError("cleanup bug")
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_next():
+            pass
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.assert_outcomes(failed=1, passed=1)
+    result.stdout.fnmatch_lines(["*_ test_query _*", "*AssertionError: cleanup bug*"])
+
+
+def test_a_cleanup_error_that_is_false_is_still_reported(pytester: Pytester):
+    """An exception is chosen over the interruption whatever its truth value."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        class FalseError(Exception):
+            def __bool__(self):
+                return False
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        async def fail_during_cleanup():
+            asyncio.get_running_loop().call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                raise FalseError("cleanup error")
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def failing_setup():
+            await fail_during_cleanup()
+            yield
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def failing_teardown():
+            yield
+            await fail_during_cleanup()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_setup(failing_setup):
+            pass
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_teardown(failing_teardown):
+            pass
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_body():
+            await fail_during_cleanup()
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.assert_outcomes(passed=1, failed=1, errors=2)
     result.stdout.fnmatch_lines(
         [
-            "*CLEANUP STARTED*",
-            "*ASYNC TEARDOWN*",
-            "*NEXT RAN*",
-            "*SYNC TEARDOWN*",
-            "*_ test_interrupted _*",
-            "*asyncio.exceptions.CancelledError*",
-            "*During handling of the above exception, another exception occurred:*",
-            "*AssertionError: cleanup bug",
+            "*ERROR at setup of test_setup*",
+            "*FalseError: cleanup error*",
+            "*ERROR at teardown of test_teardown*",
+            "*FalseError: cleanup error*",
+            "*_ test_body _*",
+            "*FalseError: cleanup error*",
         ]
     )
 
 
-@_SIGNALS
-def test_suppressed_cancellation_does_not_suppress_the_interruption(
+def test_a_test_suppressing_the_cancellation_does_not_suppress_the_interruption(
     pytester: Pytester,
 ):
-    """Ctrl-C is not the test's to suppress: the session is still interrupted."""
-    result = _run(pytester, _interrupted_test(on_cancel="pass"))
-    assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    assert "TEST CANCELLED" in out
-    assert "NEXT RAN" not in out
-    result.stdout.fnmatch_lines(["*ASYNC TEARDOWN*", "*KeyboardInterrupt*"])
-
-
-@_SIGNALS
-@pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="Task.cancelling() needs Python 3.11"
-)
-def test_interrupted_test_finds_the_request_on_its_task(pytester: Pytester):
-    """
-    The runner cancels the test's task, as asyncio.Runner does: a test
-    awaiting a child task tells the interruption, a request on its own
-    task, from a cancellation of the child alone, and does not carry on
-    serving.
-    """
-    result = _run(
-        pytester,
-        """
+    """The test runs to its end, and the session is interrupted all the same."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
         import asyncio
-        import os
-        import signal
-        import pytest
 
-        async def serve():
-            await asyncio.Event().wait()
+        import pytest
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
 
         @pytest.mark.asyncio
-        async def test_cancel_aware_parent():
-            loop = asyncio.get_running_loop()
-            loop.call_soon(os.kill, os.getpid(), signal.SIGINT)
-            child = asyncio.create_task(serve())
+        async def test_query():
+            asyncio.get_running_loop().call_soon(interrupt)
             try:
-                try:
-                    await child
-                except asyncio.CancelledError:
-                    count = asyncio.current_task().cancelling()
-                    print("PARENT CANCELLATION REQUESTS:", count)
-                    if count:
-                        raise
-                    print("CONTINUING AFTER CHILD CANCELLATION")
-                await serve()
-            finally:
-                print("PARENT CLEANUP")
-        """,
-    )
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                events.append("cancellation suppressed")
+            events.append("test returned")
+
+        @pytest.mark.asyncio
+        async def test_next():
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    assert "CONTINUING AFTER CHILD CANCELLATION" not in out
-    result.stdout.fnmatch_lines(
-        ["*PARENT CANCELLATION REQUESTS: 1*", "*PARENT CLEANUP*", "*KeyboardInterrupt*"]
-    )
+    assert _events(pytester) == ["cancellation suppressed", "test returned"]
 
 
-def test_interruption_after_the_test_ended_cancels_nothing(pytester: Pytester):
-    """
-    The loop is stopped by a callback the test scheduled before returning,
-    after the test ended and before the runner's wait for it did: there is
-    nothing to cancel or join, the test fails with asyncio's error and the
-    next test on the shared loop runs.
-    """
-    result = _run(
-        pytester,
-        """
+@_REQUIRES_311
+def test_an_interruption_is_a_cancellation_request_on_the_test_task(
+    pytester: Pytester,
+):
+    """A test awaiting a child task can tell the interruption from the child's."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
         import asyncio
+
+        import pytest
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.mark.asyncio
+        async def test_parent():
+            asyncio.get_running_loop().call_soon(interrupt)
+            child = asyncio.create_task(asyncio.Event().wait())
+            try:
+                await child
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    events.append("the test task was asked to cancel")
+                    raise
+                events.append("only the child was cancelled")
+            finally:
+                events.append("parent cleaned up")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert _events(pytester) == [
+        "the test task was asked to cancel",
+        "parent cleaned up",
+    ]
+
+
+def test_a_loop_stopped_after_the_test_returned_does_not_refuse_later_tests(
+    pytester: Pytester,
+):
+    """There is nothing to cancel: the test fails, and the shared loop goes on."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
         import pytest
         import pytest_asyncio
+        from conftest import events
 
         @pytest_asyncio.fixture(scope="module", loop_scope="module")
         async def resource():
             yield
             await asyncio.sleep(0)
-            print("RESOURCE TORN DOWN")
+            events.append("resource closed")
 
         @pytest.mark.asyncio(loop_scope="module")
-        async def test_completed(resource):
+        async def test_stop(resource):
             loop = asyncio.get_running_loop()
             loop.call_soon(loop.stop)
-            print("TEST BODY COMPLETED")
+            events.append("test returned")
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next(resource):
-            print("NEXT TEST RAN")
-        """,
-    )
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=1, passed=1)
     result.stdout.fnmatch_lines(
         [
-            "*TEST BODY COMPLETED*",
-            "*NEXT TEST RAN*",
-            "*RESOURCE TORN DOWN*",
-            "*_ test_completed _*",
+            "*_ test_stop _*",
             "*RuntimeError: Event loop stopped before Future completed*",
         ]
     )
+    assert _events(pytester) == ["test returned", "next ran", "resource closed"]
 
 
-# A task group spanning a module fixture's yield; while the runner joins the
-# interrupted test, the test makes the group's child fail, which cancels the
-# fixture's task at its yield and, through the runner, the test's once more.
-_SERVICE_FAILS_DURING_JOIN_SOURCE = """
-    import asyncio
-    import signal
-    import pytest
-    import pytest_asyncio
-
-    @pytest_asyncio.fixture(scope="module", loop_scope="module")
-    async def service():
-        trigger = asyncio.Event()
-
-        async def serve():
-            await trigger.wait()
-            raise ValueError("fixture child failed")
-
-        async with asyncio.TaskGroup() as group:
-            group.create_task(serve())
-            yield trigger
-
-    def alarm():
-        def fail(signum, frame):
-            pytest.fail("simulated pytest-timeout signal")
-
-        signal.signal(signal.SIGALRM, fail)
-        signal.setitimer(signal.ITIMER_REAL, 0.05)
-
-    async def trigger_failure(service):
-        print("TEST TRIGGERS SERVICE FAILURE")
-        service.set()
-        await asyncio.Event().wait()
-
-    async def suppress_and_trigger_failure(service):
-        # The runner's request is the only one on the task.
-        assert asyncio.current_task().uncancel() == 0
-        await trigger_failure(service)
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_interrupted(service):
-        {interrupt}
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            {on_cancel}
-        finally:
-            {cleanup}
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_later_consumer(service):
-        print("LATER CONSUMER ADMITTED")
-        pytest.fail("this consumer should have been refused")
-"""
-
-_STOP = "asyncio.get_running_loop().stop()"
-_STOPPED = "RuntimeError: Event loop stopped before Future completed"
-
-
-@_NEEDS_TASK_GROUP
-@pytest.mark.parametrize(
-    ("interrupt", "on_cancel", "cleanup", "error"),
-    [
-        pytest.param(
-            "service.set()",
-            "raise",
-            "pass",
-            "asyncio.exceptions.CancelledError",
-            id="control",
-        ),
-        pytest.param(
-            "alarm()",
-            "raise",
-            "await trigger_failure(service)",
-            "Failed: simulated pytest-timeout signal",
-            id="signal",
-            marks=_SIGNALS,
-        ),
-        pytest.param(
-            _STOP, "raise", "await trigger_failure(service)", _STOPPED, id="stop"
-        ),
-        pytest.param(
-            _STOP,
-            "await suppress_and_trigger_failure(service)",
-            "pass",
-            _STOPPED,
-            id="resolved",
-        ),
-    ],
-)
-def test_fixture_cancellation_during_interrupted_cleanup_is_kept(
-    pytester: Pytester, interrupt: str, on_cancel: str, cleanup: str, error: str
+@_REQUIRES_311
+def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup(
+    pytester: Pytester,
 ):
     """
-    The group's request, made while the runner joined the interrupted test,
-    ends the test's cleanup, even one that suppressed the runner's
-    cancellation and resolved its request (resolved), and is reported at the
-    fixture's teardown; the test fails with the interruption's error and
-    the later consumer is refused, as when the group alone cancels the test
-    (control).
+    The cleanup is cancelled once more, even after it resolved the
+    interruption's request, and the loop refuses the later tests.
     """
-    source = _SERVICE_FAILS_DURING_JOIN_SOURCE.format(
-        interrupt=interrupt, on_cancel=on_cancel, cleanup=cleanup
-    )
-    result = _run(pytester, source)
-    out = result.stdout.str()
-    assert ("TEST TRIGGERS SERVICE FAILURE" in out) is (interrupt != "service.set()")
-    assert "LATER CONSUMER ADMITTED" not in out
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        async def service():
+            trigger = asyncio.Event()
+
+            async def serve():
+                await trigger.wait()
+                raise ValueError("service failed")
+
+            async with asyncio.TaskGroup() as group:
+                group.create_task(serve())
+                yield trigger
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_interrupted(service):
+            asyncio.get_running_loop().stop()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+                service.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    events.append("cleanup ended by the service failure")
+                    raise
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_later(service):
+            events.append("later test ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     result.assert_outcomes(failed=2, errors=1)
     result.stdout.fnmatch_lines(
         [
-            "*ERROR at teardown of test_later_consumer*",
-            "*ValueError: fixture child failed*",
+            "*ERROR at teardown of test_later*",
+            "*ValueError: service failed*",
             "*_ test_interrupted _*",
-            f"*{error}*",
-            "*_ test_later_consumer _*",
+            "*RuntimeError: Event loop stopped before Future completed*",
+            "*_ test_later _*",
             _REFUSED,
         ]
     )
+    assert _events(pytester) == ["cleanup ended by the service failure"]
 
 
-@_SIGNALS
 @pytest.mark.parametrize(
     "interrupt",
-    ["loop.call_soon(os.kill, os.getpid(), signal.SIGINT)", "loop.call_soon(raise_)"],
-    ids=["sigint", "keyboard_interrupt_from_callback"],
+    [
+        pytest.param("loop.call_soon(interrupt)", id="raised_by_a_callback"),
+        pytest.param(
+            "loop.call_soon(os.kill, os.getpid(), signal.SIGINT)",
+            id="sigint",
+            marks=_POSIX,
+        ),
+    ],
 )
-def test_interruption_during_async_fixture_teardown(pytester: Pytester, interrupt: str):
-    """
-    The teardown is cancelled at its await and joined before the
-    interruption reaches pytest; the loop closes without leaving the
-    generator pending.
-    """
-    result = _run(
-        pytester,
-        f"""
+def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
+    pytester: Pytester, interrupt: str
+):
+    """The teardown ends at its await, and the loop closes with nothing pending."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent(f"""\
         import asyncio
         import os
         import signal
+
         import pytest
         import pytest_asyncio
+        from conftest import events
 
-        def raise_():
+        def interrupt():
             raise KeyboardInterrupt
 
         @pytest_asyncio.fixture
@@ -461,99 +492,87 @@ def test_interruption_during_async_fixture_teardown(pytester: Pytester, interrup
             loop = asyncio.get_running_loop()
             {interrupt}
             try:
-                await asyncio.sleep(1)
+                await asyncio.Event().wait()
             except asyncio.CancelledError:
-                print("TEARDOWN CANCELLED")
+                events.append("teardown cancelled")
                 raise
-            print("TEARDOWN FINISHED")
+            events.append("teardown finished")
 
         @pytest.mark.asyncio
         async def test_it(resource):
             pass
-        """,
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    assert "TEARDOWN FINISHED" not in out
-    result.stdout.fnmatch_lines(["*TEARDOWN CANCELLED*", "*KeyboardInterrupt*"])
-    assert "Task was destroyed" not in out + result.stderr.str()
+    assert _events(pytester) == ["teardown cancelled"]
+    assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
-def test_error_of_a_teardown_settled_just_before_its_abandonment_is_reported(
+def test_a_teardown_error_settled_as_the_second_interruption_arrives_is_reported_once(
     pytester: Pytester,
 ):
-    """
-    The teardown, cancelled by a first interruption, ends with an error in
-    the same loop iteration as a second interruption of the wait for it.
-    The interruption ends the session; the error is reported through the
-    loop's exception handler, once, like an error after the abandonment.
-    """
-    result = _run(
-        pytester,
-        """
+    """The interruption ends the session; the error is reported, not lost."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
         import asyncio
+
         import pytest
         import pytest_asyncio
 
-        def raise_():
+        def interrupt():
             raise KeyboardInterrupt
 
         @pytest_asyncio.fixture
         async def resource():
             loop = asyncio.get_running_loop()
             yield
-            loop.call_soon(raise_)
+            loop.call_soon(interrupt)
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                loop.call_soon(raise_)
-                print("TEARDOWN RAISES")
+                loop.call_soon(interrupt)
                 raise ValueError("teardown failed as the second interruption arrived")
 
         @pytest.mark.asyncio
         async def test_it(resource):
             pass
-        """,
-        "-W",
-        "error",
-        "-o",
-        "log_cli=true",
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", "-o", "log_cli=true", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    out = result.stdout.str()
-    err = result.stderr.str()
-    assert out.count("after pytest stopped waiting for it") == 1
+    assert result.stdout.str().count(_REPORTED_LATE) == 1
     result.stdout.fnmatch_lines(
-        [
-            "*TEARDOWN RAISES*",
-            "*Exception from an async fixture or test after pytest stopped waiting*",
-            "*ValueError: teardown failed as the second interruption arrived",
-            "*KeyboardInterrupt*",
-        ]
+        ["*ValueError: teardown failed as the second interruption arrived*"]
     )
     for noise in ("never retrieved", "Task was destroyed"):
-        assert noise not in out + err
+        assert noise not in result.stdout.str() + result.stderr.str()
 
 
-def test_keyboard_interrupt_from_node_finalizer(pytester: Pytester):
-    """
-    The item's remaining finalizers are lost to pytest; the runner closes
-    the fixture when the loop closes, in the fixture's own task, as
-    asyncio's shutdown closes async generators.
-    """
-    result = _run(
-        pytester,
-        """
+def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
+    pytester: Pytester,
+):
+    """An interrupted finalizer leaves the fixture to the closing of the loop."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
         import asyncio
+
         import pytest
         import pytest_asyncio
+        from conftest import events
 
         @pytest_asyncio.fixture
         async def resource():
+            task = asyncio.current_task()
             try:
                 yield
             finally:
-                print("RESOURCE TORN DOWN IN", asyncio.current_task().get_name())
+                await asyncio.sleep(0)
+                if asyncio.current_task() is task:
+                    events.append("resource closed in its own task")
 
         @pytest.mark.asyncio
         async def test_it(resource, request):
@@ -561,77 +580,325 @@ def test_keyboard_interrupt_from_node_finalizer(pytester: Pytester):
                 raise KeyboardInterrupt
 
             request.node.addfinalizer(interrupt)
-        """,
-        "-W",
-        "error",
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    result.stdout.fnmatch_lines(["*RESOURCE TORN DOWN IN resource"])
+    assert _events(pytester) == ["resource closed in its own task"]
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
-@_SIGNALS
-@pytest.mark.parametrize(
-    "hang",
-    [
-        pytest.param("await asyncio.Event().wait()", id="await"),
-        pytest.param(
-            "while True: pass",
-            id="busy",
-            marks=pytest.mark.xfail(
-                (3, 11) <= sys.version_info < (3, 13),
-                reason="CPython 3.11 and 3.12 raise an exception from a signal "
-                "handler past the try/finally of the frame it interrupts, so the "
-                "test's cleanup is skipped",
-                strict=True,
-            ),
-        ),
-    ],
-)
-def test_pytest_timeout_fails_the_hung_test(pytester: Pytester, hang: str):
-    """
-    The test fails once its cleanup has run, and the shared loop goes on. A
-    signal that interrupts the wait for the test (await) has the runner
-    cancel and join the test's task; one that interrupts the test itself
-    (busy) fails it from its own frames, as pytest.fail() would.
-    """
+@_POSIX
+def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
+    """The test's cleanup runs, its fixture is torn down and the loop goes on."""
     pytest.importorskip("pytest_timeout")
-    result = _run(
-        pytester,
-        f"""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
         import asyncio
+
         import pytest
         import pytest_asyncio
+        from conftest import events
 
         @pytest_asyncio.fixture(loop_scope="module")
         async def resource():
             yield
             await asyncio.sleep(0)
-            print("RESOURCE TORN DOWN")
+            events.append("resource closed")
 
         @pytest.mark.timeout(0.5)
         @pytest.mark.asyncio(loop_scope="module")
         async def test_hang(resource):
             try:
-                {hang}
+                await asyncio.Event().wait()
             finally:
                 await asyncio.sleep(0)
-                print("HANG CLEANED UP")
+                events.append("hang cleaned up")
 
         @pytest.mark.asyncio(loop_scope="module")
         async def test_next():
-            print("NEXT RAN")
-        """,
-        "-o",
-        "timeout_method=signal",
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
     )
     result.assert_outcomes(failed=1, passed=1)
     result.stdout.fnmatch_lines(
-        [
-            "*HANG CLEANED UP*",
-            "*RESOURCE TORN DOWN*",
-            "*NEXT RAN*",
-            "*_ test_hang _*",
-            "*Failed: Timeout (>0.5s) from pytest-timeout*",
-        ]
+        ["*_ test_hang _*", "*Failed: Timeout (>0.5s) from pytest-timeout*"]
     )
+    assert _events(pytester) == ["hang cleaned up", "resource closed", "next ran"]
+
+
+@_POSIX
+def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
+    """The signal fails the test from its own frame; the loop serves the next test."""
+    pytest.importorskip("pytest_timeout")
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        @pytest_asyncio.fixture(loop_scope="module")
+        async def resource():
+            yield
+            await asyncio.sleep(0)
+            events.append("resource closed")
+
+        @pytest.mark.timeout(0.5)
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_hang(resource):
+            while True:
+                pass
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_next():
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
+    )
+    result.assert_outcomes(failed=1, passed=1)
+    result.stdout.fnmatch_lines(
+        ["*_ test_hang _*", "*Failed: Timeout (>0.5s) from pytest-timeout*"]
+    )
+    assert _events(pytester) == ["resource closed", "next ran"]
+
+
+def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
+    pytester: Pytester,
+):
+    """Not received by pytest, the fixture is torn down by pytest-asyncio."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.fixture
+        def parent():
+            state = {"open": True}
+            yield state
+            state["open"] = False
+            events.append("parent closed")
+
+        @pytest_asyncio.fixture
+        async def child(parent):
+            asyncio.get_running_loop().call_soon(interrupt)
+            yield parent
+            await asyncio.sleep(0)
+            assert parent["open"]
+            events.append("child closed")
+
+        @pytest.mark.asyncio
+        async def test_query(child):
+            events.append("test ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert _events(pytester) == ["child closed", "parent closed"]
+
+
+@_REQUIRES_311
+def test_a_fixture_setup_that_recovers_from_the_interruption_and_yields_is_torn_down(
+    pytester: Pytester,
+):
+    """The fixture is torn down at once, its parent still open."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.fixture
+        def parent():
+            state = {"open": True}
+            yield state
+            state["open"] = False
+            events.append("parent closed")
+
+        @pytest_asyncio.fixture
+        async def child(parent):
+            asyncio.get_running_loop().call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+            yield parent
+            await asyncio.sleep(0)
+            assert parent["open"]
+            events.append("child closed")
+
+        @pytest.mark.asyncio
+        async def test_query(child):
+            events.append("test ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert _events(pytester) == ["child closed", "parent closed"]
+
+
+def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
+    pytester: Pytester,
+):
+    """The error is the fixture's setup error, and the session goes on."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.fixture
+        def parent():
+            yield
+            events.append("parent closed")
+
+        @pytest_asyncio.fixture
+        async def child(parent):
+            asyncio.get_running_loop().call_soon(interrupt)
+            yield parent
+            await asyncio.sleep(0)
+            events.append("child closed")
+            raise ValueError("child cleanup failed")
+
+        @pytest.mark.asyncio
+        async def test_query(child):
+            events.append("test ran")
+
+        @pytest.mark.asyncio
+        async def test_next():
+            events.append("next ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.assert_outcomes(errors=1, passed=1)
+    result.stdout.fnmatch_lines(
+        ["*ERROR at setup of test_query*", "*ValueError: child cleanup failed*"]
+    )
+    assert _events(pytester) == ["child closed", "parent closed", "next ran"]
+
+
+def test_a_fixture_setup_abandoned_by_a_second_interruption_reports_no_error(
+    pytester: Pytester,
+):
+    """A setup that ends cancelled has no teardown to report."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def resource():
+            loop = asyncio.get_running_loop()
+            loop.call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                loop.call_soon(interrupt)
+                await asyncio.Event().wait()
+            yield
+
+        @pytest.mark.asyncio
+        async def test_it(resource):
+            pass
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", "-o", "log_cli=true", timeout=30
+    )
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    output = result.stdout.str() + result.stderr.str()
+    for noise in (_REPORTED_LATE, "Task was destroyed", "never retrieved"):
+        assert noise not in output
+
+
+def test_a_setup_returning_without_a_yield_after_the_interruption_keeps_it(
+    pytester: Pytester,
+):
+    """A cancelled setup that cleans up and returns is not a missing yield."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent(_EVENTS_CONFTEST))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+        from conftest import events
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def resource():
+            asyncio.get_running_loop().call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                events.append("setup cleaned up")
+                return
+            yield
+
+        @pytest.mark.asyncio
+        async def test_it(resource):
+            events.append("test ran")
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert "StopAsyncIteration" not in result.stdout.str()
+    assert _events(pytester) == ["setup cleaned up"]
+
+
+def test_a_setup_returning_without_a_yield_as_the_interruption_arrives_keeps_it(
+    pytester: Pytester,
+):
+    """The interruption is reported, not the missing yield."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def resource():
+            asyncio.get_running_loop().call_soon(interrupt)
+            return
+            yield
+
+        @pytest.mark.asyncio
+        async def test_it(resource):
+            pass
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert "StopAsyncIteration" not in result.stdout.str()

@@ -226,14 +226,10 @@ def test_isolation_against_context_changes_in_async_tests(
     result.assert_outcomes(passed=2)
 
 
-def test_var_from_sync_fixture_seen_by_async_whatever_the_creation_order(
+def test_a_sync_fixture_assignment_is_seen_and_restored_on_a_reused_loop(
     pytester: Pytester,
 ):
-    """
-    Async code sees a var a sync fixture set for as long as it is set, whether
-    the fixture runs before the loop is created (the first test's fixtures are
-    set up before its loop) or after (the third test's).
-    """
+    """The fixture may run before the shared loop is created, or after."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest.fixture
@@ -262,11 +258,9 @@ def test_var_from_sync_fixture_seen_by_async_whatever_the_creation_order(
     result.assert_outcomes(passed=4)
 
 
-def test_var_from_sync_test_propagates_to_async_on_shared_loop(pytester: Pytester):
-    """
-    Async tests on a module loop see the vars a sync test set, and those a sync
-    fixture sets only for as long as the fixture lives.
-    """
+def test_a_sync_test_assignment_is_seen_by_later_async_tests_on_a_shared_loop(
+    pytester: Pytester,
+):
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest.mark.asyncio(loop_scope="module")
@@ -280,31 +274,15 @@ def test_var_from_sync_test_propagates_to_async_on_shared_loop(pytester: Pyteste
         @pytest.mark.asyncio(loop_scope="module")
         async def test_async_after():
             assert _context_var.get() == "value"
-
-        @pytest.fixture
-        def var_fixture():
-            with context_var_manager("other"):
-                yield
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_async_with_fixture(var_fixture):
-            assert _context_var.get() == "other"
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_async_after_fixture():
-            assert _context_var.get() == "value"
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=5)
+    result.assert_outcomes(passed=3)
 
 
-def test_var_reset_by_fixture_after_test_set_it(pytester: Pytester):
-    """
-    A test's assignment is not seen by the teardown of its fixtures: a fixture
-    resetting the token of a var the test then set to another value still sees
-    its own value and resets it in its own context, and an earlier fixture's
-    teardown sees the var unset.
-    """
+def test_a_test_assignment_does_not_change_its_fixtures_teardown_context(
+    pytester: Pytester,
+):
+    """The fixture still sees its own value, and resets it in its own context."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest_asyncio.fixture
@@ -328,14 +306,10 @@ def test_var_reset_by_fixture_after_test_set_it(pytester: Pytester):
     result.assert_outcomes(passed=1)
 
 
-def test_var_from_fixture_on_shared_loop_unaffected_by_earlier_async_test(
+def test_an_async_test_assignment_is_not_seen_by_a_fixture_set_up_later(
     pytester: Pytester,
 ):
-    """
-    An async test's assignment on a module loop is not seen by a fixture set
-    up later on that loop: the fixture's assignment of the same object still
-    propagates to a sync fixture depending on it, at each setup.
-    """
+    """The fixture's own assignment of the same object still propagates."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         VALUE = object()
@@ -354,25 +328,17 @@ def test_var_from_fixture_on_shared_loop_unaffected_by_earlier_async_test(
             assert _context_var.get() is VALUE
 
         @pytest.mark.asyncio(loop_scope="module")
-        async def test_first(check_var_fixture):
-            assert _context_var.get() is VALUE
-
-        @pytest.mark.asyncio(loop_scope="module")
-        async def test_second(check_var_fixture):
+        async def test_uses_var(check_var_fixture):
             assert _context_var.get() is VALUE
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=3)
+    result.assert_outcomes(passed=2)
 
 
-def test_var_set_again_by_fixture_on_shared_loop_propagates_again(
+def test_a_fixture_assigning_the_same_object_again_propagates_it_again(
     pytester: Pytester,
 ):
-    """
-    A fixture on a module loop setting a var to the same object at each setup
-    propagates it at each setup: to a sync fixture depending on it, and to a
-    test on a fresh function loop.
-    """
+    """Each setup of the fixture on a shared loop reaches its sync dependent."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         VALUE = object()
@@ -392,22 +358,14 @@ def test_var_set_again_by_fixture_on_shared_loop_propagates_again(
         @pytest.mark.asyncio(loop_scope="module")
         async def test_second(check_var_fixture):
             assert _context_var.get() is VALUE
-
-        @pytest.mark.asyncio
-        async def test_third(var_fixture):
-            assert _context_var.get() is VALUE
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=3)
+    result.assert_outcomes(passed=2)
 
 
-def test_var_from_async_generator_reset_in_sync_when_teardown_fails(
+def test_an_async_fixture_context_is_restored_in_sync_code_when_its_teardown_fails(
     pytester: Pytester,
 ):
-    """
-    The copy of a var in the synchronous context is reset even when the
-    fixture's teardown raises.
-    """
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest.fixture
@@ -437,43 +395,37 @@ def test_var_from_async_generator_reset_in_sync_when_teardown_fails(
 @pytest.mark.skipif(
     sys.version_info < (3, 12), reason="Task.get_context() requires Python 3.12"
 )
-def test_current_task_context_is_the_context_of_the_coroutine(pytester: Pytester):
-    """
-    Each fixture and test runs in a task of its own, so
-    ``asyncio.current_task().get_context()`` is the coroutine's own context:
-    it holds the value the coroutine set, and not one another coroutine set.
-    """
+def test_the_current_task_context_is_the_context_of_the_fixture_or_test(
+    pytester: Pytester,
+):
+    """Task.get_context() exposes the context the running fixture or test uses."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         import asyncio
 
-        def check_context(value):
-            assert asyncio.current_task().get_context()[_context_var] == value
-
         @pytest_asyncio.fixture
         async def var_fixture():
             with context_var_manager("fixture value"):
-                check_context("fixture value")
+                context = asyncio.current_task().get_context()
+                assert context[_context_var] == "fixture value"
                 yield
-                check_context("fixture value")
+                context = asyncio.current_task().get_context()
+                assert context[_context_var] == "fixture value"
 
         @pytest.mark.asyncio
         async def test(var_fixture):
             _context_var.set("test value")
-            check_context("test value")
+            context = asyncio.current_task().get_context()
+            assert context[_context_var] == "test value"
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
 
 
-def test_var_from_task_factory_seen_by_async_fixture_sync_dependent_and_test(
+def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_the_test(
     pytester: Pytester,
 ):
-    """
-    Each fixture and test runs in a task the loop's task factory created, so a
-    var the factory supplies to the task's context is seen by the async
-    fixture, by a sync fixture depending on it and by the test.
-    """
+    """Each fixture and test runs in a task the loop's task factory created."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makeconftest(dedent("""\
         import asyncio

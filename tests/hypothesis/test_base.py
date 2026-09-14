@@ -94,3 +94,27 @@ def test_sync_not_auto_marked(pytester: Pytester):
         """))
     result = pytester.runpytest("--asyncio-mode=auto")
     result.assert_outcomes(passed=1)
+
+
+def test_each_example_runs_in_a_task_of_its_own(pytester: Pytester):
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        from hypothesis import given, settings, strategies as st
+
+        tasks = []
+
+        @pytest.mark.asyncio(loop_scope="module")
+        @settings(max_examples=3, deadline=None, database=None)
+        @given(st.integers())
+        async def test_examples(n):
+            tasks.append(asyncio.current_task())
+
+        def test_tasks():
+            assert len(tasks) > 1
+            assert len(set(tasks)) == len(tasks)
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict", "-W default")
+    result.assert_outcomes(passed=2)
