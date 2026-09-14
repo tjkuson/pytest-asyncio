@@ -261,6 +261,7 @@ def test_a_sync_fixture_assignment_is_seen_and_restored_on_a_reused_loop(
 def test_a_sync_test_assignment_is_seen_by_later_async_tests_on_a_shared_loop(
     pytester: Pytester,
 ):
+    """Each test's task starts from the current context, however old its loop."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest.mark.asyncio(loop_scope="module")
@@ -366,6 +367,7 @@ def test_a_fixture_assigning_the_same_object_again_propagates_it_again(
 def test_an_async_fixture_context_is_restored_in_sync_code_when_its_teardown_fails(
     pytester: Pytester,
 ):
+    """The sync dependent sees the variable reset although the teardown raised."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(_prelude + dedent("""
         @pytest.fixture

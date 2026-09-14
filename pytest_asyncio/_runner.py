@@ -14,10 +14,10 @@ fixture as it waits at its yield (from a task group spanning the yield
 whose child failed, say) ends the loop's normal work: the test or setup
 running at the time is cancelled, and only teardowns run until the loop
 closes. An interruption of a synchronous call (SIGINT, or a callback
-raising) cancels the task waited for and waits for it to end, so that it
-cleans up before pytest tears down the fixtures it uses; what the cleanup
-raised is raised instead of the interruption, as asyncio.Runner does. A
-second interruption stops waiting.
+raising) cancels the task waited for and waits for it to end before
+raising, so that its cleanup runs while the fixtures it uses are alive
+(asyncio.Runner does as much for SIGINT alone); what the cleanup raised is
+raised instead of the interruption. A second interruption stops waiting.
 """
 
 from __future__ import annotations
@@ -89,13 +89,6 @@ class TaskRunner:
         finally:
             self._driver.close()
 
-    def __enter__(self) -> Self:
-        self.open()
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
-
     def get_loop(self) -> asyncio.AbstractEventLoop:
         return self._driver.get_loop()
 
@@ -137,6 +130,7 @@ class TaskRunner:
         fixture = FixtureTask(
             gen,
             lambda live: self._group.create_task(live, context=context, name=name),
+            loop=self.get_loop(),
             stop_normal_work=self._stop_normal_work,
         )
         self._fixtures.add(fixture)
@@ -246,12 +240,12 @@ if sys.version_info >= (3, 11):
 
     class _TaskGroupHost:
         """
-        A task of the runner's own, ``pytest-asyncio``, keeping a task group
-        entered from :meth:`start` to :meth:`finish`, so that the fixtures'
-        and tests' tasks are its children. A child only ends with an
-        exception if the runner has a bug (see _Captured and FixtureTask);
-        the group raises it at finish. A cancellation of the host stops the
-        loop's normal work, then cancels the children, as in any group.
+        A task of the runner's own keeping a task group entered from
+        :meth:`start` to :meth:`finish`, so that the fixtures' and tests'
+        tasks are its children. A child only ends with an exception if the
+        runner has a bug (see _Captured and FixtureTask); the group raises
+        it at finish. A cancellation of the host stops the loop's normal
+        work, then cancels the children, as in any group.
         """
 
         @classmethod
@@ -429,16 +423,16 @@ class FixtureTask(Generic[_T]):
         gen: AsyncGenerator[_T],
         create_task: Callable[[Coroutine[Any, Any, None]], asyncio.Task[None]],
         *,
+        loop: asyncio.AbstractEventLoop,
         stop_normal_work: Callable[[], None],
     ) -> None:
         self._gen = gen
         self._stop_normal_work = stop_normal_work
         self._teardown: _Captured[None] = _Captured()
         self._reported = False
-        self.task = create_task(self._live())
-        loop = self.task.get_loop()
         self.ready: asyncio.Future[FixtureSetup[_T]] = loop.create_future()
         self._action: asyncio.Future[_TeardownAction] = loop.create_future()
+        self.task = create_task(self._live())
 
     def setup_result(self) -> FixtureSetup[_T]:
         """The setup's result; raises if it failed, or the task ended before it."""
@@ -456,11 +450,10 @@ class FixtureTask(Generic[_T]):
         """
         What an interrupted setup raised, if a user error.
 
-        Interrupted, a setup that ends without yielding gives pytest the
-        interruption: not the generator's StopAsyncIteration, whether it
-        returned after the cancellation or before it arrived, and not the
-        cancellation, which is the interruption's own. Only the setup that
-        pytest reads (:meth:`setup_result`) requires a yield.
+        A setup that ends without yielding gives pytest the interruption,
+        not the generator's StopAsyncIteration, whether it returned after
+        the cancellation or before it arrived; the cancellation itself is
+        the interruption's own.
         """
         failure = _failure(self.ready) if self.ready.done() else None
         return None if isinstance(failure, StopAsyncIteration) else failure

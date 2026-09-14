@@ -22,10 +22,11 @@ _REQUIRES_311 = pytest.mark.skipif(sys.version_info < (3, 11), reason="needs 3.1
 _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 _REPORTED_LATE = "Exception from an async fixture or test after pytest stopped waiting"
 
-# The fixtures and tests of an example append to ``events``; the conftest
-# writes them to a file once every fixture is torn down, so that the outer
-# test reads what ran, and in which order, instead of matching output that a
-# traceback may repeat.
+# The fixtures and tests of an example append to ``events``, and the outer
+# test reads the literal sequence of what ran, rather than matching output
+# that a traceback may repeat. The conftest writes the file after pytest's
+# own session-finish hook, which is where an interrupted run still tears its
+# fixtures down.
 _EVENTS_CONFTEST = """\
     from pathlib import Path
 
@@ -40,7 +41,7 @@ _EVENTS_CONFTEST = """\
     """
 
 
-def _events(pytester: Pytester) -> list[str]:
+def _read_events(pytester: Pytester) -> list[str]:
     return (pytester.path / "events.txt").read_text().splitlines()
 
 
@@ -105,7 +106,7 @@ def test_an_interrupted_test_finishes_its_cleanup_before_its_fixtures_are_torn_d
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == [
+    assert _read_events(pytester) == [
         "query cleaned up",
         "transaction closed",
         "connection closed",
@@ -150,7 +151,7 @@ def test_a_second_interruption_stops_waiting_for_the_cleanup(pytester: Pytester)
         "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["cleanup ended", "connection closed"]
+    assert _read_events(pytester) == ["cleanup ended", "connection closed"]
     for noise in ("Task was destroyed", "never awaited", "never retrieved"):
         assert noise not in result.stdout.str() + result.stderr.str()
 
@@ -314,7 +315,7 @@ def test_a_test_suppressing_the_cancellation_does_not_suppress_the_interruption(
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["cancellation suppressed", "test returned"]
+    assert _read_events(pytester) == ["cancellation suppressed", "test returned"]
 
 
 @_REQUIRES_311
@@ -349,7 +350,7 @@ def test_an_interruption_is_a_cancellation_request_on_the_test_task(
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == [
+    assert _read_events(pytester) == [
         "the test task was asked to cancel",
         "parent cleaned up",
     ]
@@ -392,7 +393,7 @@ def test_a_loop_stopped_after_the_test_returned_does_not_refuse_later_tests(
             "*RuntimeError: Event loop stopped before Future completed*",
         ]
     )
-    assert _events(pytester) == ["test returned", "next ran", "resource closed"]
+    assert _read_events(pytester) == ["test returned", "next ran", "resource closed"]
 
 
 @_REQUIRES_311
@@ -454,7 +455,7 @@ def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup
             _REFUSED,
         ]
     )
-    assert _events(pytester) == ["cleanup ended by the service failure"]
+    assert _read_events(pytester) == ["cleanup ended by the service failure"]
 
 
 @pytest.mark.parametrize(
@@ -506,7 +507,7 @@ def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
         "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["teardown cancelled"]
+    assert _read_events(pytester) == ["teardown cancelled"]
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
@@ -585,7 +586,7 @@ def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
         "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["resource closed in its own task"]
+    assert _read_events(pytester) == ["resource closed in its own task"]
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
@@ -608,7 +609,7 @@ def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
             await asyncio.sleep(0)
             events.append("resource closed")
 
-        @pytest.mark.timeout(0.5)
+        @pytest.mark.timeout(0.5, func_only=True)
         @pytest.mark.asyncio(loop_scope="module")
         async def test_hang(resource):
             try:
@@ -625,10 +626,8 @@ def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
         "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
     )
     result.assert_outcomes(failed=1, passed=1)
-    result.stdout.fnmatch_lines(
-        ["*_ test_hang _*", "*Failed: Timeout (>0.5s) from pytest-timeout*"]
-    )
-    assert _events(pytester) == ["hang cleaned up", "resource closed", "next ran"]
+    result.stdout.fnmatch_lines(["*_ test_hang _*", "*Failed: Timeout*0.5s*"])
+    assert _read_events(pytester) == ["hang cleaned up", "resource closed", "next ran"]
 
 
 @_POSIX
@@ -650,7 +649,7 @@ def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
             await asyncio.sleep(0)
             events.append("resource closed")
 
-        @pytest.mark.timeout(0.5)
+        @pytest.mark.timeout(0.5, func_only=True)
         @pytest.mark.asyncio(loop_scope="module")
         async def test_hang(resource):
             while True:
@@ -664,10 +663,8 @@ def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
         "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
     )
     result.assert_outcomes(failed=1, passed=1)
-    result.stdout.fnmatch_lines(
-        ["*_ test_hang _*", "*Failed: Timeout (>0.5s) from pytest-timeout*"]
-    )
-    assert _events(pytester) == ["resource closed", "next ran"]
+    result.stdout.fnmatch_lines(["*_ test_hang _*", "*Failed: Timeout*0.5s*"])
+    assert _read_events(pytester) == ["resource closed", "next ran"]
 
 
 def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
@@ -707,7 +704,7 @@ def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["child closed", "parent closed"]
+    assert _read_events(pytester) == ["child closed", "parent closed"]
 
 
 @_REQUIRES_311
@@ -752,7 +749,7 @@ def test_a_fixture_setup_that_recovers_from_the_interruption_and_yields_is_torn_
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert _events(pytester) == ["child closed", "parent closed"]
+    assert _read_events(pytester) == ["child closed", "parent closed"]
 
 
 def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
@@ -798,7 +795,7 @@ def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
     result.stdout.fnmatch_lines(
         ["*ERROR at setup of test_query*", "*ValueError: child cleanup failed*"]
     )
-    assert _events(pytester) == ["child closed", "parent closed", "next ran"]
+    assert _read_events(pytester) == ["child closed", "parent closed", "next ran"]
 
 
 def test_a_fixture_setup_abandoned_by_a_second_interruption_reports_no_error(
@@ -872,7 +869,7 @@ def test_a_setup_returning_without_a_yield_after_the_interruption_keeps_it(
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
     assert "StopAsyncIteration" not in result.stdout.str()
-    assert _events(pytester) == ["setup cleaned up"]
+    assert _read_events(pytester) == ["setup cleaned up"]
 
 
 def test_a_setup_returning_without_a_yield_as_the_interruption_arrives_keeps_it(

@@ -26,5 +26,6 @@ async def beats():
 
 @pytest.mark.asyncio
 async def test_heartbeat_runs_during_the_test(beats):
+    beats_before = len(beats)
     await asyncio.sleep(0.05)
-    assert beats
+    assert len(beats) > beats_before
