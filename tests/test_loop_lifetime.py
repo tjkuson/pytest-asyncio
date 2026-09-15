@@ -149,3 +149,99 @@ def test_an_interruption_before_the_first_async_test_still_closes_the_loop(
     assert "LOOPS CLOSED: [True]" in result.stdout.lines
     for noise in ("Task was destroyed", "never awaited", "never retrieved"):
         assert noise not in output
+
+
+@_REQUIRES_311
+@pytest.mark.parametrize("task_factory", ["reject_task", "create_one_task"])
+def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
+    pytester: Pytester,
+    task_factory: str,
+):
+    """Failed task startup does not close a loop still used by a fixture."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makepyfile(dedent(f"""\
+        import asyncio
+        import gc
+
+        import pytest
+        import pytest_asyncio
+
+        def reject_task(loop, coro, **kwargs):
+            coro.close()
+            raise RuntimeError("task creation failed")
+
+        def create_one_task(loop, coro, **kwargs):
+            loop.set_task_factory(reject_task)
+            return asyncio.Task(coro, loop=loop, **kwargs)
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        def event_loop():
+            loop = asyncio.get_event_loop()
+            loop.set_task_factory({task_factory})
+            yield loop
+            assert not loop.is_closed()
+            loop.set_task_factory(None)
+            loop.run_until_complete(asyncio.sleep(0))
+            gc.collect()
+
+        def test_sync_fixture_can_use_its_loop(event_loop):
+            assert not event_loop.is_closed()
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_async_startup_fails(event_loop):
+            pytest.fail("test must not run when task creation fails")
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
+    )
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*RuntimeError: task creation failed*"])
+
+
+@_REQUIRES_311
+@pytest.mark.parametrize(
+    "statement", ["return", "yield"], ids=["coroutine", "generator"]
+)
+def test_task_startup_error_is_reported_for_every_consumer_of_a_shared_fixture(
+    pytester: Pytester, statement: str
+):
+    """Consumers of a shared fixture see its original startup failure."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makepyfile(dedent(f"""\
+        import asyncio
+
+        import pytest_asyncio
+
+        def reject_task(loop, coro, **kwargs):
+            coro.close()
+            raise RuntimeError("task creation failed")
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        def event_loop():
+            loop = asyncio.get_event_loop()
+            loop.set_task_factory(reject_task)
+            yield loop
+            loop.set_task_factory(None)
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        async def value(event_loop):
+            {statement} 42
+
+        def test_first_consumer(value):
+            pass
+
+        def test_second_consumer(value):
+            pass
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
+    )
+    result.assert_outcomes(errors=2)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_first_consumer*",
+            "E*RuntimeError: task creation failed",
+            "*ERROR at setup of test_second_consumer*",
+            "E*RuntimeError: task creation failed",
+        ]
+    )

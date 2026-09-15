@@ -4,9 +4,8 @@ import asyncio
 from textwrap import dedent
 
 import pytest
-from pytest import Pytester
-
 import pytest_asyncio
+from pytest import Pytester
 
 
 @pytest_asyncio.fixture
@@ -62,3 +61,71 @@ def test_sync_function_uses_async_fixture(pytester: Pytester, mode):
         """))
     result = pytester.runpytest(f"--asyncio-mode={mode}")
     result.assert_outcomes(passed=1)
+
+
+def test_sync_fixture_preserves_stop_iteration_for_xfail(pytester: Pytester):
+    """Wrapping a synchronous fixture preserves the exception matched by xfail."""
+    pytest.importorskip(
+        "pluggy",
+        minversion="1.6",
+        reason="Older pluggy replaces StopIteration from hook wrappers (pluggy#544).",
+    )
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""\
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        def value():
+            raise StopIteration("no value available")
+
+        @pytest.mark.xfail(raises=StopIteration, strict=True)
+        def test_missing_value(value):
+            pass
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(xfailed=1)
+
+
+@pytest.mark.parametrize(
+    "statement", ["return", "yield"], ids=["coroutine", "generator"]
+)
+def test_rejected_fixture_task_preserves_its_creation_error(
+    pytester: Pytester, statement: str
+):
+    """Task creation errors reach pytest without replacement errors or warnings."""
+    pytest.importorskip(
+        "pluggy",
+        minversion="1.6",
+        reason="Older pluggy replaces StopIteration from hook wrappers (pluggy#544).",
+    )
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent(f"""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        def reject_task(loop, coro, **kwargs):
+            coro.close()
+            raise StopIteration("task creation failed")
+
+        @pytest_asyncio.fixture
+        async def reject_new_tasks(request):
+            loop = asyncio.get_running_loop()
+            original_factory = loop.get_task_factory()
+            request.addfinalizer(lambda: loop.set_task_factory(original_factory))
+            loop.set_task_factory(reject_task)
+
+        @pytest_asyncio.fixture
+        async def value(reject_new_tasks):
+            {statement} 42
+
+        @pytest.mark.xfail(raises=StopIteration, strict=True)
+        def test_value(value):
+            pass
+        """))
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
+    )
+    result.assert_outcomes(xfailed=1)
