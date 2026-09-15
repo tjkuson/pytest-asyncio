@@ -14,8 +14,9 @@ The *loop_scope* of a fixture can be chosen independently from its caching *scop
 However, the event loop scope must be larger or the same as the fixture's caching scope.
 In other words, it's possible to reevaluate an async fixture multiple times within the same event loop, but it's not possible to switch out the running event loop in an async fixture.
 
-The setup and teardown of an async generator fixture run in the same asyncio task, which stays alive across the fixture's ``yield``.
+With :ref:`configuration/experimental_asyncio_task_group_runner` enabled, the setup and teardown of an async generator fixture run in the same asyncio task, which stays alive across the fixture's ``yield``.
 This allows an ``asyncio.TaskGroup``, an ``asyncio.timeout`` or a cancel scope to span the ``yield`` (see :ref:`concepts/tasks`).
+With the default runner, setup and teardown run in separate tasks.
 
 Examples:
 
@@ -26,8 +27,10 @@ Examples:
 
 .. _decorators/pytest_asyncio_fixture/cancellation:
 
-Cancellation and errors
------------------------
+Experimental cancellation and errors
+------------------------------------
+
+The following behavior applies when the experimental task group runner is enabled.
 
 When an async generator fixture is cancelled while it waits at its ``yield``, for example by a task group spanning the ``yield`` whose child failed, the test or fixture setup running at the time is cancelled.
 If the ``CancelledError`` escapes the test, the test fails with it, with a note explaining the cause on Python 3.11 and later; a test may catch it, as any asyncio code may.

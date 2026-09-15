@@ -30,7 +30,11 @@ def test_interrupted_test_finishes_cleanup_before_fixture_teardown(
     pytester: Pytester, interrupt: str
 ):
     """The test fills its buffer before async cleanup saves it to the open file."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent(f"""\
         import asyncio
         from io import StringIO
@@ -77,7 +81,11 @@ def test_interrupted_test_finishes_cleanup_before_fixture_teardown(
 
 def test_a_second_interruption_stops_waiting_for_the_cleanup(pytester: Pytester):
     """Cancellation of the abandoned cleanup still lets it save its partial result."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -120,7 +128,11 @@ def test_an_error_raised_after_the_second_interruption_is_reported_once(
     pytester: Pytester,
 ):
     """The abandoned cleanup's error goes to the loop's exception handler."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -158,7 +170,11 @@ def test_an_error_raised_after_the_second_interruption_is_reported_once(
 
 def test_a_cleanup_error_is_reported_instead_of_the_interruption(pytester: Pytester):
     """The test fails with its cleanup's error, and the session goes on."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -189,7 +205,11 @@ def test_cleanup_errors_are_reported_even_when_they_evaluate_to_false(
     pytester: Pytester,
 ):
     """A cleanup error takes precedence even when bool(exception) is False."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -251,7 +271,11 @@ def test_a_test_suppressing_the_cancellation_does_not_suppress_the_interruption(
     pytester: Pytester,
 ):
     """The test runs to its end, and the session is interrupted all the same."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -289,7 +313,11 @@ def test_an_interruption_is_a_cancellation_request_on_the_test_task(
     pytester: Pytester,
 ):
     """A test awaiting a child task can tell the interruption from the child's."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -320,7 +348,11 @@ def test_a_loop_stopped_after_the_test_returned_does_not_refuse_later_tests(
     pytester: Pytester,
 ):
     """There is nothing to cancel: the test fails, and the shared loop goes on."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -353,7 +385,11 @@ def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup
     The cleanup is cancelled once more, even after it resolved the
     interruption's request, and the loop refuses the later tests.
     """
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -415,7 +451,11 @@ def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
     pytester: Pytester, interrupt: str
 ):
     """The teardown ends at its await, and the loop closes with nothing pending."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import os
@@ -456,7 +496,11 @@ def test_a_teardown_error_settled_as_the_second_interruption_arrives_is_reported
     pytester: Pytester,
 ):
     """The interruption ends the session; the error is reported, not lost."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -497,7 +541,11 @@ def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
     pytester: Pytester,
 ):
     """An interrupted finalizer leaves the fixture to the closing of the loop."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         from io import StringIO
@@ -536,7 +584,11 @@ def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
 def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
     """The timed-out test can save its result, and the shared loop serves the next."""
     pytest.importorskip("pytest_timeout")
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -574,7 +626,11 @@ def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
 def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
     """The signal fails the test from its own frame; the loop serves the next test."""
     pytest.importorskip("pytest_timeout")
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import pytest
 
@@ -599,7 +655,11 @@ def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
     pytester: Pytester,
 ):
     """A fixture pytest never received can still save to its parent's open file."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -636,7 +696,11 @@ def test_a_fixture_setup_that_recovers_from_the_interruption_and_yields_is_torn_
     pytester: Pytester,
 ):
     """Recovering setup is finalized while it can still write to its parent's file."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -676,7 +740,11 @@ def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
     pytester: Pytester,
 ):
     """The error is the fixture's setup error, and the session goes on."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -713,7 +781,11 @@ def test_a_fixture_setup_abandoned_by_a_second_interruption_reports_no_error(
     pytester: Pytester,
 ):
     """A setup that ends cancelled has no teardown to report."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -751,7 +823,11 @@ def test_cancelled_fixture_returning_without_yield_preserves_keyboard_interrupt(
     pytester: Pytester,
 ):
     """A missing yield must not replace KeyboardInterrupt after cancelled setup."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         from pathlib import Path
@@ -787,7 +863,11 @@ def test_fixture_setup_returning_without_yield_reports_a_pending_keyboard_interr
     pytester: Pytester,
 ):
     """The interruption is reported, not the missing yield."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 

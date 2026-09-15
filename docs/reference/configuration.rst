@@ -56,3 +56,28 @@ The value can also be set via the ``--asyncio-mode`` command-line option:
 
 
 If the asyncio mode is set in both the pytest configuration file and the command-line option, the command-line option takes precedence. If no asyncio mode is specified, the mode defaults to `strict`.
+
+.. _configuration/experimental_asyncio_task_group_runner:
+
+experimental_asyncio_task_group_runner
+======================================
+Enables the experimental task group runner. This boolean option defaults to ``false``.
+Its behavior may change before it becomes the default in pytest-asyncio version 2.
+
+The experimental runner runs the setup and teardown of an async generator fixture in the same task, allowing a task group or cancel scope to span the fixture's ``yield``.
+It also changes cancellation and error handling; see :ref:`concepts/tasks` and the :ref:`fixture cancellation reference <decorators/pytest_asyncio_fixture/cancellation>`.
+The default runner retains the existing execution behavior, including separate tasks for async generator fixture setup and teardown.
+Both runners preserve fixture context-variable propagation and test isolation.
+
+To enable it in ``pytest.ini``:
+
+.. code-block:: ini
+
+   [pytest]
+   experimental_asyncio_task_group_runner = true
+
+To enable it for one run:
+
+.. code-block:: console
+
+   $ pytest -o experimental_asyncio_task_group_runner=true

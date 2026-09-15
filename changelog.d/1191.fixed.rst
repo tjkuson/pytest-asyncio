@@ -1,1 +1,1 @@
-AnyIO cancel scopes and task groups can span the ``yield`` of an async generator fixture without raising "Attempted to exit cancel scope in a different task".
+With the experimental task group runner enabled, AnyIO cancel scopes and task groups can span the ``yield`` of an async generator fixture without raising "Attempted to exit cancel scope in a different task". Enable :ref:`configuration/experimental_asyncio_task_group_runner` to use this behavior.

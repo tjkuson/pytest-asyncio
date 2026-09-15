@@ -62,7 +62,11 @@ def test_a_loop_that_cannot_create_tasks_is_closed_and_the_error_reported(
     pytester: Pytester,
 ):
     """Every test of the scope errors with the loop's error; nothing else runs."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = module"
+    )
     pytester.makeconftest(dedent("""\
         import asyncio
 
@@ -158,7 +162,11 @@ def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
     task_factory: str,
 ):
     """Failed task startup does not close a loop still used by a fixture."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = module"
+    )
     pytester.makepyfile(dedent(f"""\
         import asyncio
         import gc

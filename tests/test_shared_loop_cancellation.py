@@ -21,7 +21,11 @@ _REFUSED = "*RuntimeError: This event loop no longer accepts new tests*"
 )
 def test_a_test_cancelling_its_own_task_fails_alone(pytester: Pytester, after: str):
     """Its fixture is torn down, and the later tests on the loop run."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent(f"""\
         import asyncio
         from io import StringIO
@@ -61,7 +65,11 @@ def test_a_test_cancelling_its_own_task_fails_alone(pytester: Pytester, after: s
 
 def test_a_test_suppressing_its_own_cancellation_passes(pytester: Pytester):
     """Cancelling its own task is the test's business: nothing else notices."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         import contextlib
@@ -84,7 +92,11 @@ def test_a_test_suppressing_its_own_cancellation_passes(pytester: Pytester):
 
 def test_an_error_raised_after_a_self_cancellation_is_the_failure(pytester: Pytester):
     """The error wins over the pending cancellation, as in any task."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -113,7 +125,11 @@ def test_a_keyboard_interrupt_raised_after_a_self_cancellation_interrupts_the_se
     pytester: Pytester,
 ):
     """The interruption wins over the pending cancellation: the session stops."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -140,7 +156,11 @@ def test_a_test_cancelling_every_task_makes_the_loop_refuse_later_tests(
     asyncio.all_tasks() includes the fixture waiting at its yield and
     pytest-asyncio's own task: the loop runs nothing but teardowns after that.
     """
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         from io import StringIO
@@ -192,7 +212,11 @@ def test_a_coroutine_fixture_cancelled_during_its_setup_errors_only_its_test(
     pytester: Pytester,
 ):
     """The cancellation is reported as an ordinary setup error; the loop goes on."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -226,7 +250,11 @@ def test_a_generator_fixture_cancelled_during_its_setup_errors_only_its_test(
     pytester: Pytester,
 ):
     """A generator that never reached its yield is reported the same way."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -262,7 +290,11 @@ def test_cancelled_fixture_setup_leaves_its_task_cancelled(
     pytester: Pytester, finish_setup: str
 ):
     """Reporting a setup error to pytest must preserve the task's cancelled state."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent(f"""\
         import asyncio
 
@@ -299,7 +331,11 @@ def test_a_module_fixture_cancelled_during_its_setup_errors_each_of_its_tests(
     pytester: Pytester,
 ):
     """The setup error is cached for the fixture's other users; the loop goes on."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -346,7 +382,11 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
     Later tests and fixture setups on the loop are refused; teardowns run;
     a test on a loop of its own and the next module's loop are unaffected.
     """
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(
         test_a_service=dedent("""\
             import asyncio
@@ -422,7 +462,11 @@ def test_a_test_stopping_the_loop_fails_and_the_loop_serves_the_later_tests(
     pytester: Pytester,
 ):
     """The stopped loop interrupts the wait: the test is cancelled and fails."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         from io import StringIO
@@ -467,7 +511,11 @@ def test_a_sync_test_closing_the_shared_loop_fails_the_later_async_tests(
     pytester: Pytester,
 ):
     """They fail with asyncio's error, and pytest-asyncio warns as it closes."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 
@@ -499,7 +547,11 @@ def test_a_sync_test_closing_the_shared_loop_fails_the_later_async_tests(
 
 def test_a_background_task_runs_until_its_loop_closes(pytester: Pytester):
     """A task a fixture leaves running is cancelled when the loop closes."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
         from io import StringIO
@@ -546,7 +598,11 @@ def test_a_sync_test_can_drive_the_loop_while_an_anyio_scope_is_cancelled(
     AnyIO keeps cancelling the fixture's task while it waits at its yield;
     a coroutine the sync test runs on the loop still completes.
     """
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makepyfile(dedent("""\
         import asyncio
 

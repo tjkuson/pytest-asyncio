@@ -428,7 +428,11 @@ def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_th
     pytester: Pytester,
 ):
     """Each fixture and test runs in a task the loop's task factory created."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
     pytester.makeconftest(dedent("""\
         import asyncio
         import contextvars
