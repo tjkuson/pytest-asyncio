@@ -257,6 +257,44 @@ def test_a_generator_fixture_cancelled_during_its_setup_errors_only_its_test(
     )
 
 
+@pytest.mark.parametrize("finish_setup", ["return", "yield"])
+def test_cancelled_fixture_setup_leaves_its_task_cancelled(
+    pytester: Pytester, finish_setup: str
+):
+    """Reporting a setup error to pytest must preserve the task's cancelled state."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent(f"""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def cancelled(request):
+            task = asyncio.current_task()
+
+            def check_task_cancelled():
+                assert task.cancelled()
+
+            request.addfinalizer(check_task_cancelled)
+            task.cancel("setup cancelled")
+            await asyncio.sleep(0)
+            {finish_setup}
+
+        @pytest.mark.asyncio
+        async def test_uses_fixture(cancelled):
+            pass
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    result.assert_outcomes(errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*CancelledError: setup cancelled*",
+            "*PytestAsyncioError: The setup of the async fixture was cancelled.*",
+        ]
+    )
+
+
 def test_a_module_fixture_cancelled_during_its_setup_errors_each_of_its_tests(
     pytester: Pytester,
 ):

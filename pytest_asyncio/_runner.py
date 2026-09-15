@@ -6,7 +6,7 @@ group that owns every fixture and test task. Pytest runs each fixture setup,
 test and fixture teardown as one synchronous call, which drives the loop
 until that work is done and reads its result: a fixture's setup is ready
 while its task lives on; a test, and a fixture's teardown, are done when
-their task is. Closing the runner finishes the group and joins its tasks.
+their task is. Closing the test runner finishes the group and joins its tasks.
 The separate pytest fixture owning the loop then closes it.
 
 Two policies decide the exceptional paths. A cancellation reaching a
@@ -53,15 +53,14 @@ class TestRunner:
     def __init__(self, asyncio_runner: Runner) -> None:
         self._asyncio_runner = asyncio_runner
         self._teardown_only = False
-        # The test or fixture setup being waited for, cancelled with a
-        # fixture waiting at its yield (see _stop_normal_work).
+        # A suspended fixture's cancellation also cancels the current test or setup.
         self._active: asyncio.Task[object] | None = None
         # The generator fixtures whose tasks are alive: closed at close.
         self._fixtures: set[FixtureTask[Any]] = set()
         # The tasks pytest stopped waiting for: cancelled once more at close.
         self._abandoned: set[asyncio.Task[object]] = set()
         self._task_group_host = _TaskGroupHost.start(
-            asyncio_runner, self._stop_normal_work
+            asyncio_runner, self._cancel_active_work_and_refuse_new_work
         )
 
     def close(self) -> None:
@@ -124,7 +123,9 @@ class TestRunner:
                 live, context=context, name=name
             ),
             loop=self.get_loop(),
-            stop_normal_work=self._stop_normal_work,
+            cancel_active_work_and_refuse_new_work=(
+                self._cancel_active_work_and_refuse_new_work
+            ),
         )
         self._fixtures.add(fixture)
         fixture.task.add_done_callback(lambda _: self._fixtures.discard(fixture))
@@ -170,7 +171,7 @@ class TestRunner:
 
     @contextlib.contextmanager
     def _as_active(self, task: asyncio.Task[object]) -> Generator[None]:
-        """The test or setup pytest waits for, cancelled by _stop_normal_work."""
+        """Track the test or setup to cancel if a suspended fixture is cancelled."""
         self._active = task
         try:
             yield
@@ -218,8 +219,7 @@ class TestRunner:
             released.cancel()
         return None
 
-    def _stop_normal_work(self) -> None:
-        """A fixture waiting at its yield, or the runner's task, was cancelled."""
+    def _cancel_active_work_and_refuse_new_work(self) -> None:
         self._teardown_only = True
         if self._active is not None:
             self._active.cancel()
@@ -230,23 +230,27 @@ if sys.version_info >= (3, 11):
 
     class _TaskGroupHost:
         """
-        A task of the runner's own keeping a task group entered from
+        A task of the test runner's own keeping a task group entered from
         :meth:`start` to :meth:`finish`, so that the fixtures' and tests'
         tasks are its children. A child only ends with an exception if the
-        runner has a bug (see _Captured and FixtureTask); the group raises
+        test runner has a bug (see _Captured and FixtureTask); the group raises
         it at finish. A cancellation of the host stops the loop's normal
         work, then cancels the children, as in any group.
         """
 
         @classmethod
         def start(
-            cls, asyncio_runner: Runner, stop_normal_work: Callable[[], None]
+            cls,
+            asyncio_runner: Runner,
+            cancel_active_work_and_refuse_new_work: Callable[[], None],
         ) -> Self:
             """Start the host and drive the loop until the group is entered."""
             loop = asyncio_runner.get_loop()
             closing = asyncio.Event()
             entered: asyncio.Future[asyncio.TaskGroup] = loop.create_future()
-            keep_entered = cls._keep_group_entered(entered, closing, stop_normal_work)
+            keep_entered = cls._keep_group_entered(
+                entered, closing, cancel_active_work_and_refuse_new_work
+            )
             host = loop.create_task(keep_entered, name="pytest-asyncio")
             try:
                 startup: list[asyncio.Future[Any]] = [entered, host]
@@ -291,10 +295,10 @@ if sys.version_info >= (3, 11):
             return context.run(self._group.create_task, coro, name=name)
 
         def finish(self) -> None:
-            """Exit the group, which joins its tasks; raise what the host ended with."""
+            """Join the host and report errors other than cancellation."""
             self._closing.set()
             self._asyncio_runner.run(asyncio.wait([self._host]))
-            failure = _failure(self._host)
+            failure = _non_cancellation_exception(self._host)
             if failure is not None:
                 raise failure
 
@@ -302,14 +306,14 @@ if sys.version_info >= (3, 11):
         async def _keep_group_entered(
             entered: asyncio.Future[asyncio.TaskGroup],
             closing: asyncio.Event,
-            stop_normal_work: Callable[[], None],
+            cancel_active_work_and_refuse_new_work: Callable[[], None],
         ) -> None:
             async with asyncio.TaskGroup() as group:
                 entered.set_result(group)
                 try:
                     await closing.wait()
                 except asyncio.CancelledError:
-                    stop_normal_work()
+                    cancel_active_work_and_refuse_new_work()
                     raise
 
 else:
@@ -319,7 +323,9 @@ else:
 
         @classmethod
         def start(
-            cls, asyncio_runner: Runner, stop_normal_work: Callable[[], None]
+            cls,
+            asyncio_runner: Runner,
+            cancel_active_work_and_refuse_new_work: Callable[[], None],
         ) -> Self:
             return cls(asyncio_runner)
 
@@ -393,10 +399,10 @@ class _Captured(Generic[_T]):
         if self._reported:
             return
         self._reported = True
+        if task.cancelled() and self.failure() is None:
+            return
         try:
             self.read(task)
-        except asyncio.CancelledError:
-            pass
         except BaseException as exc:
             _report_unobserved(task, exc)
 
@@ -411,7 +417,7 @@ class FixtureSetup(Generic[_T]):
 
 class _TeardownAction(enum.Enum):
     FINISH = enum.auto()  # run the fixture from its yield to its end
-    CLOSE = enum.auto()  # close the generator: the runner is closing
+    CLOSE = enum.auto()  # close the generator: the test runner is closing
 
 
 class FixtureTask(Generic[_T]):
@@ -431,15 +437,17 @@ class FixtureTask(Generic[_T]):
         create_task: Callable[[Coroutine[Any, Any, None]], asyncio.Task[None]],
         *,
         loop: asyncio.AbstractEventLoop,
-        stop_normal_work: Callable[[], None],
+        cancel_active_work_and_refuse_new_work: Callable[[], None],
     ) -> None:
         self._gen = gen
-        self._stop_normal_work = stop_normal_work
+        self._cancel_active_work_and_refuse_new_work = (
+            cancel_active_work_and_refuse_new_work
+        )
         self._teardown: _Captured[None] = _Captured()
         self._reported = False
         self.ready: asyncio.Future[FixtureSetup[_T]] = loop.create_future()
         self._action: asyncio.Future[_TeardownAction] = loop.create_future()
-        self.task = create_task(self._live())
+        self.task = create_task(self._run_fixture())
 
     def setup_result(self) -> FixtureSetup[_T]:
         """The setup's result; raises if it failed, or the task ended before it."""
@@ -462,7 +470,7 @@ class FixtureTask(Generic[_T]):
         the cancellation or before it arrived; the cancellation itself is
         the interruption's own.
         """
-        failure = _failure(self.ready) if self.ready.done() else None
+        failure = _non_cancellation_exception(self.ready) if self.ready.done() else None
         return None if isinstance(failure, StopAsyncIteration) else failure
 
     def teardown_failure(self) -> BaseException | None:
@@ -492,9 +500,12 @@ class FixtureTask(Generic[_T]):
         elif (failure := self.interrupted_setup_failure()) is not None:
             _report_unobserved(task, failure)
 
-    async def _live(self) -> None:
+    async def _run_fixture(self) -> None:
         try:
             value = await anext(self._gen)
+        except asyncio.CancelledError as exc:
+            self.ready.set_exception(exc)
+            raise
         except BaseException as exc:
             self.ready.set_exception(exc)
             return
@@ -503,11 +514,10 @@ class FixtureTask(Generic[_T]):
             try:
                 await asyncio.wait([self._action])
             except asyncio.CancelledError:
-                # A cancellation at the yield (a task group's, say) is
-                # consumed here, not replayed into the generator: the task
-                # keeps waiting, so that pytest tears the fixtures down in
-                # its order and this fixture's teardown exits the scope.
-                self._stop_normal_work()
+                # Keep resources alive until pytest tears down their dependents.
+                # Leave cancellation counts to the fixture's scopes. They will
+                # not receive this exception; yield-spanning timeouts can miss it.
+                self._cancel_active_work_and_refuse_new_work()
         await self._teardown.run(self._tear_down(self._action.result()))
 
     async def _tear_down(self, action: _TeardownAction) -> None:
@@ -530,8 +540,8 @@ def _close(work: Coroutine[Any, Any, Any] | AsyncGenerator[Any]) -> None:
     # An async generator not started needs no closing.
 
 
-def _failure(future: asyncio.Future[Any]) -> BaseException | None:
-    """The exception of the done future, unless it is a cancellation."""
+def _non_cancellation_exception(future: asyncio.Future[Any]) -> BaseException | None:
+    """Read a finished future's exception, treating cancellation separately."""
     exc = None if future.cancelled() else future.exception()
     return None if isinstance(exc, asyncio.CancelledError) else exc
 
