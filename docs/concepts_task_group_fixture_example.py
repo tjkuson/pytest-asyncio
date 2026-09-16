@@ -1,31 +1,30 @@
 import asyncio
-import sys
 
 import pytest
+
 import pytest_asyncio
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="asyncio.TaskGroup requires Python 3.11"
-)
 
-
-async def heartbeat(beats: list[float]) -> None:
+async def write_heartbeats(output):
     while True:
-        beats.append(asyncio.get_running_loop().time())
+        output.write("alive\n")
+        output.flush()
         await asyncio.sleep(0.01)
 
 
 @pytest_asyncio.fixture
-async def beats():
-    beats: list[float] = []
-    async with asyncio.TaskGroup() as tg:
-        task = tg.create_task(heartbeat(beats))
-        yield beats
-        task.cancel()
+async def heartbeat_log(tmp_path):
+    path = tmp_path / "heartbeat.log"
+    with path.open("w") as output:
+        async with asyncio.TaskGroup() as group:
+            task = group.create_task(write_heartbeats(output))
+            try:
+                yield path
+            finally:
+                task.cancel()
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_runs_during_the_test(beats):
-    beats_before = len(beats)
+async def test_background_task_records_a_heartbeat(heartbeat_log):
     await asyncio.sleep(0.05)
-    assert len(beats) > beats_before
+    assert "alive" in heartbeat_log.read_text()

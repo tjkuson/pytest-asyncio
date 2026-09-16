@@ -61,13 +61,10 @@ If the asyncio mode is set in both the pytest configuration file and the command
 
 experimental_asyncio_task_group_runner
 ======================================
-Enables the experimental task group runner. This boolean option defaults to ``false``.
-Its behavior may change before it becomes the default in pytest-asyncio version 2.
 
-The experimental runner runs the setup and teardown of an async generator fixture in the same task, allowing a task group or cancel scope to span the fixture's ``yield``.
-It also changes cancellation and error handling; see :ref:`concepts/tasks` and the :ref:`fixture cancellation reference <decorators/pytest_asyncio_fixture/cancellation>`.
-The default runner retains the existing execution behavior, including separate tasks for async generator fixture setup and teardown.
-Both runners preserve fixture context-variable propagation and test isolation.
+Enables task groups and cancel scopes spanning an async generator fixture's ``yield`` (see :ref:`concepts/tasks`).
+Requires Python 3.11 or later and defaults to ``false``.
+The experimental behavior may change before becoming the default in pytest-asyncio version 2.
 
 To enable it in ``pytest.ini``:
 
@@ -81,3 +78,39 @@ To enable it for one run:
 .. code-block:: console
 
    $ pytest -o experimental_asyncio_task_group_runner=true
+
+.. _configuration/experimental_asyncio_task_group_runner/cancellation:
+
+Cancellation and cleanup
+------------------------
+
+If a fixture is cancelled while in use, any async test or async fixture setup still running on its loop is cancelled too.
+Further async tests and fixture setups cannot run on that loop, including tests that do not use the cancelled fixture.
+Fixture teardown still follows pytest's usual order.
+Further cancellation can interrupt cleanup that awaits.
+
+Pytest reports unhandled cancellation as a test failure or a fixture setup or teardown error.
+If a task group or timeout fails while its fixture is suspended at ``yield``, pytest reports the error at fixture teardown.
+This also applies when the test handles its own cancellation.
+
+After Ctrl-C or a signal-based timeout, pytest-asyncio waits for async cleanup before allowing fixture resources to close.
+A second interruption stops that wait, so cleanup may be incomplete; errors raised later may appear only in captured logs.
+
+If cleanup does not finish after a signal-based timeout, the test run can hang.
+For a process-level deadline, use an external watchdog or the ``thread`` method of `pytest-timeout <https://github.com/pytest-dev/pytest-timeout/blob/main/README.rst#timeout-methods>`_.
+This can end the test run before cleanup or report generation finishes.
+
+.. _configuration/experimental_asyncio_task_group_runner/compatibility:
+
+Compatibility notes
+-------------------
+
+The experimental runner preserves :ref:`fixture context propagation and test isolation <concepts/context_variables>`.
+Each Hypothesis example also gets a fresh context; the default runner shares a context between examples of one test.
+Custom task factories that modify context variables may produce different values with the two runners.
+
+A cancelled AnyIO scope spanning ``yield`` can repeatedly cancel its fixture while it waits for teardown, consuming CPU.
+
+Code inspecting a test task's exception may not see failures reported by pytest.
+Pytest-asyncio also manages internal tasks that may appear in ``asyncio.all_tasks()``.
+Their names, number and arrangement are not part of its public API and may change between releases.

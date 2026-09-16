@@ -5,8 +5,10 @@ sync shim for Hypothesis.
 
 from __future__ import annotations
 
+import sys
 from textwrap import dedent
 
+import pytest
 from pytest import Pytester
 
 
@@ -96,26 +98,36 @@ def test_sync_not_auto_marked(pytester: Pytester):
     result.assert_outcomes(passed=1)
 
 
-def test_each_example_runs_in_a_task_of_its_own(pytester: Pytester):
-    """Each generated example gets a distinct task."""
-    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent("""\
-        import asyncio
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
+)
+def test_experimental_runner_isolates_context_variables_between_examples(
+    pytester: Pytester,
+):
+    """Each example starts without context assignments made by earlier examples."""
+    pytester.makeini(dedent("""
+        [pytest]
+        asyncio_default_fixture_loop_scope = function
+        experimental_asyncio_task_group_runner = true
+        """))
+    pytester.makepyfile(dedent("""
+        from contextvars import ContextVar
 
         import pytest
-        from hypothesis import given, settings, strategies as st
+        from hypothesis import example, given, settings, strategies as st
 
-        tasks = []
+        request_id = ContextVar("request_id", default="initial")
 
         @pytest.mark.asyncio(loop_scope="module")
-        @settings(max_examples=3, deadline=None, database=None)
-        @given(st.integers())
-        async def test_examples(n):
-            tasks.append(asyncio.current_task())
-
-        def test_tasks():
-            assert len(tasks) > 1
-            assert len(set(tasks)) == len(tasks)
+        @settings(database=None, deadline=None)
+        @example(value=False)
+        @example(value=True)
+        @given(value=st.booleans())
+        async def test_example(value):
+            assert request_id.get() == "initial"
+            request_id.set("changed")
         """))
-    result = pytester.runpytest("--asyncio-mode=strict", "-W default")
-    result.assert_outcomes(passed=2)
+
+    result = pytester.runpytest("--asyncio-mode=strict")
+
+    result.assert_outcomes(passed=1)

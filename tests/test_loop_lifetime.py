@@ -12,7 +12,7 @@ import pytest
 from pytest import Pytester
 
 _REQUIRES_311 = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="pytest-asyncio's own task needs 3.11"
+    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
 )
 
 
@@ -169,7 +169,6 @@ def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
     )
     pytester.makepyfile(dedent(f"""\
         import asyncio
-        import gc
 
         import pytest
         import pytest_asyncio
@@ -190,7 +189,6 @@ def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
             assert not loop.is_closed()
             loop.set_task_factory(None)
             loop.run_until_complete(asyncio.sleep(0))
-            gc.collect()
 
         def test_sync_fixture_can_use_its_loop(event_loop):
             assert not event_loop.is_closed()
@@ -253,3 +251,97 @@ def test_task_startup_error_is_reported_for_every_consumer_of_a_shared_fixture(
             "E*RuntimeError: task creation failed",
         ]
     )
+
+
+def test_a_loop_factory_failure_is_cached_for_all_fixture_consumers(pytester: Pytester):
+    """A failed runner acquisition does not run or retry the dependent fixture."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = module")
+    pytester.makeconftest(dedent("""\
+        def unavailable_loop():
+            with open("factory-calls.txt", "a") as calls:
+                calls.write("called\\n")
+            raise LookupError("the loop is unavailable")
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"unavailable": unavailable_loop}
+        """))
+    pytester.makepyfile(dedent("""\
+        from pathlib import Path
+
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture(scope="module", loop_scope="module")
+        async def value():
+            Path("fixture-ran.txt").touch()
+            return 42
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_first(value):
+            pass
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_second(value):
+            pass
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(errors=2)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_first*",
+            "*LookupError: the loop is unavailable*",
+            "*ERROR at setup of test_second*",
+            "*LookupError: the loop is unavailable*",
+        ]
+    )
+    assert (pytester.path / "factory-calls.txt").read_text() == "called\n"
+    assert not (pytester.path / "fixture-ran.txt").exists()
+
+
+@_REQUIRES_311
+def test_a_second_interruption_during_shutdown_still_closes_the_loop(
+    pytester: Pytester,
+):
+    """The loop closes even after a second interruption during shutdown."""
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makeconftest(dedent("""\
+        import asyncio
+        from pathlib import Path
+
+        loops = []
+
+        def loop_factory():
+            loop = asyncio.new_event_loop()
+            loops.append(loop)
+            return loop
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"tracked": loop_factory}
+
+        def pytest_unconfigure(config):
+            Path("loop-closed.txt").write_text(
+                str([loop.is_closed() for loop in loops])
+            )
+        """))
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest.mark.asyncio
+        async def test_interrupted(request):
+            loop = asyncio.get_running_loop()
+            request.addfinalizer(lambda: loop.call_soon(interrupt))
+            raise KeyboardInterrupt
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret != pytest.ExitCode.OK
+    assert "KeyboardInterrupt" in result.stdout.str() + result.stderr.str()
+    assert (pytester.path / "loop-closed.txt").read_text() == "[True]"

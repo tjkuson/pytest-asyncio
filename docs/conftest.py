@@ -13,5 +13,7 @@ def pytest_collection_modifyitems(
     for item in items:
         if item.path == example:
             item.add_marker(
-                pytest.mark.skip(reason="Requires the experimental task group runner")
+                pytest.mark.skip(
+                    reason="Example for the experimental task group runner"
+                )
             )

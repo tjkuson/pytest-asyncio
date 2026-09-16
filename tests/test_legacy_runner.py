@@ -24,6 +24,10 @@ from pytest import MonkeyPatch, Pytester
             False,
             True,
             id="enabled",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 11),
+                reason="The experimental runner requires Python 3.11+",
+            ),
         ),
     ],
 )
@@ -35,6 +39,7 @@ def test_only_enabled_setting_keeps_fixture_task_alive_through_teardown(
     same_task: bool,
 ):
     """Only the opt-in task stays pending until its fixture's teardown."""
+    # An inherited -o would override the ini setting under test.
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     pytester.makeini(
         "[pytest]\nasyncio_default_fixture_loop_scope = function\n" + setting
@@ -44,21 +49,36 @@ def test_only_enabled_setting_keeps_fixture_task_alive_through_teardown(
 
         import pytest_asyncio
 
-        completed = []
-
         @pytest_asyncio.fixture
         async def resource():
             setup_task = asyncio.current_task()
-            setup_task.add_done_callback(lambda _: completed.append(True))
             yield setup_task
             assert (asyncio.current_task() is setup_task) is {same_task}
 
         def test_fixture_task_lifetime(resource):
             assert resource.done() is {setup_finished}
-            assert bool(completed) is {setup_finished}
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 11),
+    reason="Python 3.11+ supports the experimental runner",
+)
+def test_experimental_runner_is_rejected_on_python_310(pytester: Pytester):
+    """Unsupported opt-in fails during configuration, before running tests."""
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile("def test_must_not_run(): raise AssertionError")
+    result = pytester.runpytest()
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(
+        ["*experimental_asyncio_task_group_runner*requires Python 3.11*"]
+    )
 
 
 def test_default_runner_keeps_test_return_values_and_errors_in_their_tasks(

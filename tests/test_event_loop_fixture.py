@@ -55,7 +55,7 @@ def test_closing_event_loop_in_sync_fixture_teardown_raises_warning(
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", "--assert=plain")
     result.assert_outcomes(passed=1, warnings=1)
     result.stdout.fnmatch_lines(
-        ["*An exception occurred while pytest-asyncio closed the event loop*"]
+        ["*An exception occurred during teardown of an asyncio.Runner*"]
     )
 
 

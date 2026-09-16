@@ -19,7 +19,6 @@ from collections.abc import (
     Awaitable,
     Callable,
     Collection,
-    Coroutine as AbstractCoroutine,
     Generator,
     Iterable,
     Iterator,
@@ -30,6 +29,7 @@ from types import AsyncGeneratorType, CoroutineType
 from typing import (
     TYPE_CHECKING,
     Any,
+    Final,
     Literal,
     ParamSpec,
     TypeAlias,
@@ -39,7 +39,6 @@ from typing import (
 )
 
 import pluggy
-
 import pytest
 from _pytest.fixtures import resolve_fixture_function
 from pytest import (
@@ -56,7 +55,10 @@ from pytest import (
     PytestPluginManager,
 )
 
-from ._runner import TestRunner
+_PYTHON_311_OR_NEWER: Final = sys.version_info >= (3, 11)
+
+if TYPE_CHECKING or _PYTHON_311_OR_NEWER:
+    from ._runner import FixtureSetup, TaskGroupLoopOwner, TaskGroupRunner
 
 if sys.version_info >= (3, 11):
     from asyncio import Runner
@@ -140,7 +142,7 @@ def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None
     )
     parser.addini(
         "experimental_asyncio_task_group_runner",
-        help="use the experimental task-group runner for async fixtures and tests",
+        help="use the experimental task group runner for async fixtures and tests",
         type="bool",
         default=False,
     )
@@ -304,6 +306,13 @@ def _validate_scope(scope: str | None, option_name: str) -> None:
 
 
 def pytest_configure(config: Config) -> None:
+    if (
+        config.getini("experimental_asyncio_task_group_runner")
+        and not _PYTHON_311_OR_NEWER
+    ):
+        raise pytest.UsageError(
+            "experimental_asyncio_task_group_runner requires Python 3.11 or newer"
+        )
     default_fixture_loop_scope = config.getini("asyncio_default_fixture_loop_scope")
     _validate_scope(default_fixture_loop_scope, "asyncio_default_fixture_loop_scope")
     if not default_fixture_loop_scope:
@@ -351,7 +360,7 @@ def _wrap_fixture(
     dependency_name = (
         f"_{loop_scope}_scoped_test_runner"
         if use_task_group
-        else f"_{loop_scope}_scoped_asyncio_runner"
+        else f"_{loop_scope}_scoped_loop_owner"
     )
 
     def get_dependency() -> Any:
@@ -369,11 +378,22 @@ def _wrap_fixture(
         )
         return value
 
-    if not is_async_fixture:
+    if inspect.isasyncgenfunction(fixture_function):
+        if use_task_group:
+            return _wrap_task_group_asyncgen_fixture(
+                fixture_function, get_dependency, request, name=fixturedef.argname
+            )
+        return _wrap_asyncgen_fixture(fixture_function, get_dependency, request)
+    elif inspect.iscoroutinefunction(fixture_function):
+        if use_task_group:
+            return _wrap_task_group_async_fixture(
+                fixture_function, get_dependency, request, name=fixturedef.argname
+            )
+        return _wrap_async_fixture(fixture_function, get_dependency, request)
+    elif inspect.isgeneratorfunction(fixture_function):
+        return _wrap_syncgen_fixture(fixture_function, get_dependency)
+    else:
         return _wrap_sync_fixture(fixture_function, get_dependency)
-    if use_task_group:
-        return _wrap_task_group_fixture(fixture_function, request, get_dependency)
-    return _wrap_legacy_async_fixture(fixture_function, request, get_dependency)
 
 
 def _is_running_in_event_loop() -> bool:
@@ -384,40 +404,46 @@ def _is_running_in_event_loop() -> bool:
     return True
 
 
-def _wrap_sync_fixture(
-    fixture_function: Callable[..., object],
-    get_asyncio_runner: Callable[[], Runner],
-) -> Callable[..., object]:
-    if inspect.isgeneratorfunction(fixture_function):
-        generator_function = fixture_function
+SyncGenFixtureParams = ParamSpec("SyncGenFixtureParams")
+SyncGenFixtureYieldType = TypeVar("SyncGenFixtureYieldType")
 
-        @functools.wraps(generator_function)
-        def syncgen_fixture(*args: object, **kwargs: object) -> Generator[object]:
-            asyncio_runner = get_asyncio_runner()
-            with _temporary_event_loop(asyncio_runner.get_loop()):
-                yield from generator_function(*args, **kwargs)
 
-        return syncgen_fixture
-
+def _wrap_syncgen_fixture(
+    fixture_function: Callable[
+        SyncGenFixtureParams, Generator[SyncGenFixtureYieldType]
+    ],
+    get_loop_owner: Callable[[], Runner | TaskGroupLoopOwner],
+) -> Callable[SyncGenFixtureParams, Generator[SyncGenFixtureYieldType]]:
     @functools.wraps(fixture_function)
-    def sync_fixture(*args: object, **kwargs: object) -> object:
-        asyncio_runner = get_asyncio_runner()
-        with _temporary_event_loop(asyncio_runner.get_loop()):
+    def _syncgen_fixture_wrapper(
+        *args: SyncGenFixtureParams.args,
+        **kwargs: SyncGenFixtureParams.kwargs,
+    ) -> Generator[SyncGenFixtureYieldType]:
+        loop_owner = get_loop_owner()
+        with _temporary_event_loop(loop_owner.get_loop()):
+            yield from fixture_function(*args, **kwargs)
+
+    return _syncgen_fixture_wrapper
+
+
+SyncFixtureParams = ParamSpec("SyncFixtureParams")
+SyncFixtureReturnType = TypeVar("SyncFixtureReturnType")
+
+
+def _wrap_sync_fixture(
+    fixture_function: Callable[SyncFixtureParams, SyncFixtureReturnType],
+    get_loop_owner: Callable[[], Runner | TaskGroupLoopOwner],
+) -> Callable[SyncFixtureParams, SyncFixtureReturnType]:
+    @functools.wraps(fixture_function)
+    def _sync_fixture_wrapper(
+        *args: SyncFixtureParams.args,
+        **kwargs: SyncFixtureParams.kwargs,
+    ) -> SyncFixtureReturnType:
+        loop_owner = get_loop_owner()
+        with _temporary_event_loop(loop_owner.get_loop()):
             return fixture_function(*args, **kwargs)
 
-    return sync_fixture
-
-
-def _wrap_legacy_async_fixture(
-    fixture_function: Callable[..., object],
-    request: FixtureRequest,
-    get_asyncio_runner: Callable[[], Runner],
-) -> Callable[..., object]:
-    """Preserve the default task behavior until the TaskGroup runner replaces it."""
-    if inspect.isasyncgenfunction(fixture_function):
-        return _wrap_asyncgen_fixture(fixture_function, get_asyncio_runner, request)
-    assert inspect.iscoroutinefunction(fixture_function)
-    return _wrap_async_fixture(fixture_function, get_asyncio_runner, request)
+    return _sync_fixture_wrapper
 
 
 AsyncGenFixtureParams = ParamSpec("AsyncGenFixtureParams")
@@ -547,107 +573,94 @@ def _apply_contextvar_changes(
     return restore_contextvars
 
 
-_CANCELLED_NOTE = (
-    "An async generator fixture was cancelled while it waited at its yield, or "
-    "pytest-asyncio's own task was: fixture teardowns still run on this event "
-    "loop, but no new tests or fixture setups."
-)
-
-_T = TypeVar("_T")
-
-
-def _run_task_group_test(
-    test_runner: TestRunner,
-    coro: AbstractCoroutine[Any, Any, _T],
-    context: contextvars.Context,
-    name: str,
-) -> _T:
-    try:
-        return test_runner.run(coro, context=context, name=name)
-    except asyncio.CancelledError as exc:
-        if test_runner.teardown_only and sys.version_info >= (3, 11):
-            exc.add_note(_CANCELLED_NOTE)
-        raise
-
-
-def _cancelled_fixture_error(phase: str, test_runner: TestRunner) -> PytestAsyncioError:
-    # CancelledError is outside pytest's handled fixture exceptions. Translate
-    # it so pytest caches the setup error and continues the remaining finalizers.
-    msg = f"The {phase} of the async fixture was cancelled."
-    if test_runner.teardown_only:
-        msg += " " + _CANCELLED_NOTE
+def _cancelled_fixture_error(
+    phase: Literal["setup", "teardown"], name: str, test_runner: TaskGroupRunner
+) -> PytestAsyncioError:
+    # Translate only at pytest's boundary: it must cache setup errors and
+    # continue other finalizers. The fixture's native task stays cancelled.
+    msg = f"The {phase} of async fixture {name!r} was cancelled."
+    if test_runner.refusal_reason is not None:
+        msg += " " + test_runner.refusal_reason
     return PytestAsyncioError(msg)
 
 
-def _wrap_task_group_fixture(
-    fixture_function: Callable[..., object],
+def _wrap_task_group_asyncgen_fixture(
+    fixture_function: Callable[
+        AsyncGenFixtureParams, AsyncGeneratorType[AsyncGenFixtureYieldType, None]
+    ],
+    get_test_runner: Callable[[], TaskGroupRunner],
     request: FixtureRequest,
-    get_test_runner: Callable[[], TestRunner],
-) -> Callable[..., object]:
-    if inspect.isasyncgenfunction(fixture_function):
-        asyncgen_function = fixture_function
-
-        @functools.wraps(asyncgen_function)
-        def asyncgen_fixture(*args: object, **kwargs: object) -> object:
-            test_runner = get_test_runner()
-            context = contextvars.copy_context()
-            try:
-                fixture = test_runner.start_fixture(
-                    asyncgen_function(*args, **kwargs),
-                    context=context,
-                    name=request.fixturename,
-                )
-            except asyncio.CancelledError as exc:
-                raise _cancelled_fixture_error("setup", test_runner) from exc
-            setup = fixture.setup_result()
-            restore_contextvars = _apply_task_group_contextvar_changes(
-                context, setup.context
-            )
-
-            def finalizer() -> None:
-                try:
-                    test_runner.finish_fixture(fixture)
-                except asyncio.CancelledError as exc:
-                    raise _cancelled_fixture_error("teardown", test_runner) from exc
-                finally:
-                    restore_contextvars()
-
-            request.addfinalizer(finalizer)
-            return setup.value
-
-        return asyncgen_fixture
-
-    assert inspect.iscoroutinefunction(fixture_function)
-    async_function = fixture_function
-
-    @functools.wraps(async_function)
-    def async_fixture(*args: object, **kwargs: object) -> object:
+    *,
+    name: str,
+) -> Callable[AsyncGenFixtureParams, AsyncGenFixtureYieldType]:
+    @functools.wraps(fixture_function)
+    def asyncgen_fixture(
+        *args: AsyncGenFixtureParams.args, **kwargs: AsyncGenFixtureParams.kwargs
+    ) -> AsyncGenFixtureYieldType:
         test_runner = get_test_runner()
-        context = contextvars.copy_context()
-
-        async def setup_coroutine() -> tuple[object, contextvars.Context]:
-            result = await async_function(*args, **kwargs)
-            return result, contextvars.copy_context()
-
         try:
-            result, after = test_runner.run(
-                setup_coroutine(), context=context, name=request.fixturename
+            fixture, setup = test_runner.start_fixture(
+                fixture_function(*args, **kwargs),
+                context=contextvars.copy_context(),
+                name=name,
             )
         except asyncio.CancelledError as exc:
-            raise _cancelled_fixture_error("setup", test_runner) from exc
-        request.addfinalizer(_apply_task_group_contextvar_changes(context, after))
-        return result
+            raise _cancelled_fixture_error("setup", name, test_runner) from exc
+        restore_contextvars = _apply_task_group_contextvar_changes(setup.context)
+
+        def finalizer() -> None:
+            try:
+                test_runner.finish_fixture(fixture)
+            except asyncio.CancelledError as exc:
+                raise _cancelled_fixture_error("teardown", name, test_runner) from exc
+            finally:
+                restore_contextvars()
+
+        request.addfinalizer(finalizer)
+        return setup.value
+
+    return asyncgen_fixture
+
+
+def _wrap_task_group_async_fixture(
+    fixture_function: Callable[
+        AsyncFixtureParams, CoroutineType[object, object, AsyncFixtureReturnType]
+    ],
+    get_test_runner: Callable[[], TaskGroupRunner],
+    request: FixtureRequest,
+    *,
+    name: str,
+) -> Callable[AsyncFixtureParams, AsyncFixtureReturnType]:
+    @functools.wraps(fixture_function)
+    def async_fixture(
+        *args: AsyncFixtureParams.args, **kwargs: AsyncFixtureParams.kwargs
+    ) -> AsyncFixtureReturnType:
+        test_runner = get_test_runner()
+
+        async def setup_coroutine() -> FixtureSetup[AsyncFixtureReturnType]:
+            result = await fixture_function(*args, **kwargs)
+            return FixtureSetup(result, contextvars.copy_context())
+
+        try:
+            setup = test_runner.run(
+                setup_coroutine(), context=contextvars.copy_context(), name=name
+            )
+        except asyncio.CancelledError as exc:
+            raise _cancelled_fixture_error("setup", name, test_runner) from exc
+        request.addfinalizer(_apply_task_group_contextvar_changes(setup.context))
+        return setup.value
 
     return async_fixture
 
 
 def _apply_task_group_contextvar_changes(
-    before: contextvars.Context, after: contextvars.Context
+    fixture_context: contextvars.Context,
 ) -> Callable[[], None]:
     """Expose fixture changes to dependents and return their reset finalizer."""
-    tokens = []
-    for var, value in after.items():
-        if var in before and before[var] is value:
+    current_context = contextvars.copy_context()
+    tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
+    for var, value in fixture_context.items():
+        if var in current_context and current_context[var] is value:
             continue
         tokens.append((var, var.set(value)))
 
@@ -702,6 +715,10 @@ class PytestAsyncioFunction(Function):
         raise NotImplementedError()
 
     def setup(self) -> None:
+        if _is_running_in_event_loop():
+            raise RuntimeError(
+                "pytest-asyncio cannot run async tests inside a running event loop"
+            )
         if self._execution_fixture_name not in self.fixturenames:
             self.fixturenames.append(self._execution_fixture_name)
         # When loop factories are configured, resolve the loop factory
@@ -715,7 +732,8 @@ class PytestAsyncioFunction(Function):
     def runtest(self) -> None:
         func = getattr(*self._synchronization_target_attr)
         if self.config.getini("experimental_asyncio_task_group_runner"):
-            test_runner: TestRunner = self._request.getfixturevalue(
+            __tracebackhide__ = True
+            test_runner: TaskGroupRunner = self._request.getfixturevalue(
                 self._execution_fixture_name
             )
             context = contextvars.copy_context()
@@ -734,7 +752,7 @@ class PytestAsyncioFunction(Function):
     def _execution_fixture_name(self) -> str:
         if self.config.getini("experimental_asyncio_task_group_runner"):
             return f"_{self._loop_scope}_scoped_test_runner"
-        return f"_{self._loop_scope}_scoped_asyncio_runner"
+        return f"_{self._loop_scope}_scoped_loop_owner"
 
     @functools.cached_property
     def _loop_scope(self) -> _ScopeName:
@@ -1077,12 +1095,18 @@ def _synchronize_coroutine(
 
 def _synchronize_task_group_coroutine(
     func: Callable[_P, CoroutineType[object, object, object]],
-    test_runner: TestRunner,
+    test_runner: TaskGroupRunner,
     context: contextvars.Context,
 ) -> Callable[_P, None]:
     @functools.wraps(func)
     def inner(*args: _P.args, **kwargs: _P.kwargs) -> None:
-        _run_task_group_test(test_runner, func(*args, **kwargs), context, func.__name__)
+        __tracebackhide__ = True
+        try:
+            test_runner.run(func(*args, **kwargs), context=context, name=func.__name__)
+        except asyncio.CancelledError as exc:
+            if test_runner.refusal_reason is not None and sys.version_info >= (3, 11):
+                exc.add_note(test_runner.refusal_reason)
+            raise
 
     return inner
 
@@ -1185,30 +1209,26 @@ def _get_default_test_loop_scope(config: Config) -> Any:
 
 
 _RUNNER_TEARDOWN_WARNING = """\
-An exception occurred while pytest-asyncio closed the event loop of a scope. \
-This warning will become an error in a future version of pytest-asyncio. The \
-traceback of the exception:
-%s\
+An exception occurred during teardown of an asyncio.Runner. \
+The reason is likely that you closed the underlying event loop in a test, \
+which prevents the cleanup of asynchronous generators by the runner.
+This warning will become an error in future versions of pytest-asyncio. \
+Please ensure that your tests don't close the event loop. \
+Here is the traceback of the exception triggered during teardown:
+%s
 """
 
 
-@contextlib.contextmanager
-def _test_runner(asyncio_runner: Runner) -> Iterator[TestRunner]:
-    """Own the task group while borrowing its dependency's event loop."""
+def _get_task_group_runner(loop_owner: TaskGroupLoopOwner) -> TaskGroupRunner:
     try:
-        test_runner = TestRunner(asyncio_runner)
+        return loop_owner.get_task_group_runner()
     except asyncio.CancelledError as exc:
-        msg = "The initialization of pytest-asyncio's event loop runner was cancelled."
-        raise PytestAsyncioError(msg) from exc
-    try:
-        yield test_runner
-    finally:
-        # The loop owner reports premature closure; the group cannot run cleanup.
-        if not asyncio_runner.get_loop().is_closed():
-            _close_with_warning(test_runner)
+        raise PytestAsyncioError(
+            "The initialization of the task group runner was cancelled."
+        ) from exc
 
 
-def _close_with_warning(resource: Runner | TestRunner) -> None:
+def _close_with_warning(resource: Runner | TaskGroupLoopOwner) -> None:
     """Preserve the existing warning policy for failed loop-scope cleanup."""
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -1233,22 +1253,25 @@ def _as_current_event_loop(loop: AbstractEventLoop) -> Iterator[None]:
         _set_event_loop(None)
 
 
-def _create_scoped_asyncio_runner_fixture(scope: _ScopeName) -> Callable:
+def _create_scoped_loop_owner_fixture(scope: _ScopeName) -> Callable:
     @pytest.fixture(
         scope=scope,
-        name=f"_{scope}_scoped_asyncio_runner",
+        name=f"_{scope}_scoped_loop_owner",
     )
-    def _scoped_asyncio_runner(
+    def _scoped_loop_owner(
         event_loop_policy,
         _asyncio_loop_factory,
         request: FixtureRequest,
-    ) -> Iterator[Runner]:
+    ) -> Iterator[Runner | TaskGroupLoopOwner]:
         with _temporary_event_loop_policy(event_loop_policy):
             asyncio_runner = Runner(
                 debug=_get_asyncio_debug(request.config),
                 loop_factory=_asyncio_loop_factory,
             )
-            loop = asyncio_runner.get_loop()
+            loop_owner: Runner | TaskGroupLoopOwner = asyncio_runner
+            if request.config.getini("experimental_asyncio_task_group_runner"):
+                loop_owner = TaskGroupLoopOwner(asyncio_runner)
+            loop = loop_owner.get_loop()
             current_loop_context = (
                 _as_current_event_loop(loop)
                 if _asyncio_loop_factory is not None
@@ -1256,57 +1279,50 @@ def _create_scoped_asyncio_runner_fixture(scope: _ScopeName) -> Callable:
             )
             with current_loop_context:
                 try:
-                    yield asyncio_runner
+                    yield loop_owner
                 finally:
-                    _close_with_warning(asyncio_runner)
+                    _close_with_warning(loop_owner)
 
-    return _scoped_asyncio_runner
+    return _scoped_loop_owner
 
 
 for scope in get_args(_ScopeName):
-    globals()[f"_{scope}_scoped_asyncio_runner"] = (
-        _create_scoped_asyncio_runner_fixture(scope)
-    )
+    globals()[f"_{scope}_scoped_loop_owner"] = _create_scoped_loop_owner_fixture(scope)
 
 
 @pytest.fixture(scope="function")
 def _function_scoped_test_runner(
-    _function_scoped_asyncio_runner: Runner,
-) -> Iterator[TestRunner]:
-    with _test_runner(_function_scoped_asyncio_runner) as test_runner:
-        yield test_runner
+    _function_scoped_loop_owner: TaskGroupLoopOwner,
+) -> TaskGroupRunner:
+    return _get_task_group_runner(_function_scoped_loop_owner)
 
 
 @pytest.fixture(scope="class")
 def _class_scoped_test_runner(
-    _class_scoped_asyncio_runner: Runner,
-) -> Iterator[TestRunner]:
-    with _test_runner(_class_scoped_asyncio_runner) as test_runner:
-        yield test_runner
+    _class_scoped_loop_owner: TaskGroupLoopOwner,
+) -> TaskGroupRunner:
+    return _get_task_group_runner(_class_scoped_loop_owner)
 
 
 @pytest.fixture(scope="module")
 def _module_scoped_test_runner(
-    _module_scoped_asyncio_runner: Runner,
-) -> Iterator[TestRunner]:
-    with _test_runner(_module_scoped_asyncio_runner) as test_runner:
-        yield test_runner
+    _module_scoped_loop_owner: TaskGroupLoopOwner,
+) -> TaskGroupRunner:
+    return _get_task_group_runner(_module_scoped_loop_owner)
 
 
 @pytest.fixture(scope="package")
 def _package_scoped_test_runner(
-    _package_scoped_asyncio_runner: Runner,
-) -> Iterator[TestRunner]:
-    with _test_runner(_package_scoped_asyncio_runner) as test_runner:
-        yield test_runner
+    _package_scoped_loop_owner: TaskGroupLoopOwner,
+) -> TaskGroupRunner:
+    return _get_task_group_runner(_package_scoped_loop_owner)
 
 
 @pytest.fixture(scope="session")
 def _session_scoped_test_runner(
-    _session_scoped_asyncio_runner: Runner,
-) -> Iterator[TestRunner]:
-    with _test_runner(_session_scoped_asyncio_runner) as test_runner:
-        yield test_runner
+    _session_scoped_loop_owner: TaskGroupLoopOwner,
+) -> TaskGroupRunner:
+    return _get_task_group_runner(_session_scoped_loop_owner)
 
 
 @pytest.fixture(scope="session")

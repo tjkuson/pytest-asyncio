@@ -4,8 +4,9 @@ import asyncio
 from textwrap import dedent
 
 import pytest
-import pytest_asyncio
 from pytest import Pytester
+
+import pytest_asyncio
 
 
 @pytest_asyncio.fixture
