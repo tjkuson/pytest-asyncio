@@ -8,9 +8,7 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
-)
+_PYTHON_BEFORE_311 = sys.version_info < (3, 11)
 _REFUSED = "*This event loop no longer accepts new async tests*"
 
 
@@ -135,6 +133,9 @@ def test_a_keyboard_interrupt_raised_after_a_self_cancellation_interrupts_the_se
     result.assert_outcomes()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize(
     "finish_setup", ["return", "yield"], ids=["coroutine", "generator"]
 )
@@ -177,6 +178,9 @@ def test_a_fixture_cancelled_during_setup_errors_only_its_test(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize("finish_setup", ["return", "yield"])
 def test_cancelled_fixture_setup_leaves_its_task_cancelled(
     pytester: Pytester, finish_setup: str
@@ -219,6 +223,9 @@ def test_cancelled_fixture_setup_leaves_its_task_cancelled(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_module_fixture_cancelled_during_its_setup_errors_each_of_its_tests(
     pytester: Pytester,
 ):
@@ -266,6 +273,9 @@ def test_a_module_fixture_cancelled_during_its_setup_errors_each_of_its_tests(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
     pytester: Pytester,
 ):
@@ -349,6 +359,9 @@ def test_a_fixture_cancelled_at_its_yield_makes_its_loop_refuse_new_work(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_test_stopping_the_loop_fails_and_the_loop_serves_the_later_tests(
     pytester: Pytester,
 ):
@@ -474,6 +487,9 @@ def test_a_background_task_runs_until_its_loop_closes(pytester: Pytester):
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_sync_test_can_drive_the_loop_while_an_anyio_scope_is_cancelled(
     pytester: Pytester,
 ):

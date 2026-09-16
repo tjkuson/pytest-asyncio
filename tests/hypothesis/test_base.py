@@ -131,3 +131,58 @@ def test_experimental_runner_isolates_context_variables_between_examples(
     result = pytester.runpytest("--asyncio-mode=strict")
 
     result.assert_outcomes(passed=1)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
+)
+def test_examples_keep_fixture_context_when_task_factory_changes_calling_context(
+    pytester: Pytester,
+):
+    """A task factory's assignment does not leak into later Hypothesis examples."""
+    pytester.makeini(dedent("""
+        [pytest]
+        asyncio_default_fixture_loop_scope = function
+        experimental_asyncio_task_group_runner = true
+        """))
+    pytester.makepyfile(dedent("""
+        import asyncio
+        from contextvars import ContextVar
+
+        import pytest
+        import pytest_asyncio
+        from hypothesis import example, given, settings, strategies as st
+
+        request_id = ContextVar("request_id", default="initial")
+
+        @pytest_asyncio.fixture
+        async def task_factory():
+            request_id.set("fixture")
+            loop = asyncio.get_running_loop()
+            original_factory = loop.get_task_factory()
+
+            def create_task(loop, coro, context=None):
+                task = asyncio.Task(coro, loop=loop, context=context)
+                request_id.set("factory")
+                return task
+
+            loop.set_task_factory(create_task)
+            try:
+                yield
+            finally:
+                loop.set_task_factory(original_factory)
+
+        @pytest.mark.usefixtures("task_factory")
+        @pytest.mark.asyncio
+        @settings(database=None, deadline=None)
+        @example(value=False)
+        @example(value=True)
+        @given(value=st.booleans())
+        async def test_example(value):
+            assert request_id.get() == "fixture"
+            request_id.set("example")
+        """))
+
+    result = pytester.runpytest("--asyncio-mode=strict")
+
+    result.assert_outcomes(passed=1)

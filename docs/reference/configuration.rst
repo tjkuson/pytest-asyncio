@@ -94,9 +94,9 @@ If a task group or timeout fails while its fixture is suspended at ``yield``, py
 This also applies when the test handles its own cancellation.
 
 After Ctrl-C or a signal-based timeout, pytest-asyncio waits for async cleanup before allowing fixture resources to close.
-A second interruption stops that wait, so cleanup may be incomplete; errors raised later may appear only in captured logs.
-
 If cleanup does not finish after a signal-based timeout, the test run can hang.
+A second interruption stops that wait, so cleanup may be incomplete; errors raised later may not be reported.
+
 For a process-level deadline, use an external watchdog or the ``thread`` method of `pytest-timeout <https://github.com/pytest-dev/pytest-timeout/blob/main/README.rst#timeout-methods>`_.
 This can end the test run before cleanup or report generation finishes.
 

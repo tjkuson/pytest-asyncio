@@ -488,6 +488,7 @@ def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_th
         def trace():
             return _trace
 
+        # Existing factories need not accept task names.
         def traced_task_factory(loop, coro, *, context=None):
             calling_context = contextvars.copy_context()
             calling_context.run(_trace.set, "instrumented")
@@ -525,10 +526,10 @@ def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_th
     sys.version_info < (3, 11),
     reason="The experimental runner requires Python 3.11",
 )
-def test_a_task_factory_assignment_propagates_from_the_async_fixture_to_sync_code(
+def test_sync_dependents_see_context_assigned_by_factory_before_task_creation(
     pytester: Pytester,
 ):
-    """The experimental runner propagates the factory's inherited context."""
+    """The experimental runner propagates the value inherited by the fixture task."""
     pytester.makeini(
         "[pytest]\n"
         "experimental_asyncio_task_group_runner = true\n"
@@ -543,15 +544,13 @@ def test_a_task_factory_assignment_propagates_from_the_async_fixture_to_sync_cod
         value = ContextVar("value")
 
         @pytest_asyncio.fixture
-        async def instrument():
+        async def configured_task_factory():
             token = value.set("fixture")
             loop = asyncio.get_running_loop()
             original_factory = loop.get_task_factory()
 
             def task_factory(loop, coro, context=None, **kwargs):
-                # Change inherited contexts, leaving explicitly supplied ones alone.
-                if context is None:
-                    value.set("factory")
+                value.set("factory")
                 return asyncio.Task(coro, loop=loop, context=context, **kwargs)
 
             loop.set_task_factory(task_factory)
@@ -562,7 +561,7 @@ def test_a_task_factory_assignment_propagates_from_the_async_fixture_to_sync_cod
                 value.reset(token)
 
         @pytest_asyncio.fixture
-        async def resource(instrument):
+        async def resource(configured_task_factory):
             assert value.get() == "factory"
             return value.get()
 
@@ -577,7 +576,7 @@ def test_a_task_factory_assignment_propagates_from_the_async_fixture_to_sync_cod
 @pytest.mark.parametrize(
     "fixture_exit", ["return", "yield"], ids=["coroutine", "generator"]
 )
-def test_sync_dependents_see_fixture_values_after_task_factory_context_changes(
+def test_sync_dependents_keep_fixture_context_when_factory_assigns_after_task_creation(
     pytester: Pytester, fixture_exit: Literal["return", "yield"]
 ):
     """Factory changes outside the fixture's task do not replace its setup values."""

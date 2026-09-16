@@ -82,7 +82,7 @@ class TaskGroupRunner:
         coro: Coroutine[object, object, _T],
         *,
         context: contextvars.Context,
-        name: str | None = None,
+        name: str,
     ) -> _T:
         """Run the coroutine in a task of its own and return its result."""
         if self._refusal_reason is not None:
@@ -141,17 +141,12 @@ class TaskGroupRunner:
                 self._join_or_abandon(
                     fixture.task, fixture.report_unobserved, ready=fixture.ready
                 )
-        # Interrupted, the fixture is not handed to pytest, which will not
-        # tear it down: it ends here, before pytest tears down the fixtures
-        # it depends on. One that recovered and yielded is torn down, as
-        # pytest would have.
+        # Pytest never receives an interrupted fixture. End it here while its
+        # dependencies still exist, tearing down a recovered setup normally.
         if fixture.yielded:
             fixture.request_teardown()
             self._join_or_abandon(fixture.task, fixture.report_unobserved)
-            failure = fixture.teardown_failure()
-        else:
-            failure = fixture.interrupted_setup_failure()
-        raise _interruption_or_cleanup_error(interruption, failure)
+        raise _interruption_or_cleanup_error(interruption, fixture.failure())
 
     def finish_fixture(self, fixture: FixtureTask[_T]) -> None:
         """Run the fixture from its yield to its end, in its task."""
@@ -162,8 +157,7 @@ class TaskGroupRunner:
             return
         fixture.task.cancel()
         self._join_or_abandon(fixture.task, fixture.report_unobserved)
-        failure = fixture.teardown_failure()
-        raise _interruption_or_cleanup_error(interruption, failure)
+        raise _interruption_or_cleanup_error(interruption, fixture.failure())
 
     @contextlib.contextmanager
     def _cancellable_operation(self, cancel: Callable[[], object]) -> Generator[None]:
@@ -288,12 +282,11 @@ class _TaskGroupHost:
         coro: Coroutine[object, object, _T],
         *,
         context: contextvars.Context,
-        name: str | None,
+        name: str,
     ) -> asyncio.Task[_T]:
-        # A factory's assignments must not change a context reused by the caller.
+        # Hypothesis reuses the supplied context for each example.
         task = context.copy().run(self._group.create_task, coro)
-        if name is not None:
-            task.set_name(name)
+        task.set_name(name)
         return task
 
     def finish(self) -> None:
@@ -325,7 +318,7 @@ class _Captured(Generic[_T]):
     """
     Keep user errors for pytest instead of cancelling unrelated group children.
 
-    Cancellation still ends the native task. Read the outcome only after joining it.
+    Cancellation propagates normally. Read the outcome only after joining the task.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -355,13 +348,9 @@ class _Captured(Generic[_T]):
         return self._outcome.exception() if self._outcome.done() else None
 
     def report_unobserved(self, task: asyncio.Task[object]) -> None:
-        """A done callback for a task nobody reads: report an exception to the loop."""
-        if task.cancelled() and self.failure() is None:
-            return
-        try:
-            self.read(task)
-        except BaseException as exc:
-            _report_unobserved(task, exc)
+        """Report a captured failure; the TaskGroup handles uncaught task errors."""
+        if (failure := self.failure()) is not None:
+            _report_unobserved(task, failure)
 
 
 @dataclass(frozen=True)
@@ -422,14 +411,13 @@ class FixtureTask(Generic[_T]):
         """The setup reached the yield: the task waits there, or tears down."""
         return self.ready.done() and self.ready.exception() is None
 
-    def interrupted_setup_failure(self) -> BaseException | None:
-        """Preserve the interruption when cancelled setup returns without yielding."""
+    def failure(self) -> BaseException | None:
+        """What an interrupted setup or teardown raised, other than cancellation."""
+        if self.yielded:
+            return self._teardown.failure()
         failure = _non_cancellation_exception(self.ready) if self.ready.done() else None
+        # A cancelled setup that returns without yielding keeps the interruption.
         return None if isinstance(failure, StopAsyncIteration) else failure
-
-    def teardown_failure(self) -> BaseException | None:
-        """What the teardown raised, if anything."""
-        return self._teardown.failure()
 
     def request_teardown(self) -> None:
         self._action.set_result(_TeardownAction.FINISH)
@@ -449,9 +437,7 @@ class FixtureTask(Generic[_T]):
         if self._reported:
             return
         self._reported = True
-        if self.yielded:
-            self._teardown.report_unobserved(task)
-        elif (failure := self.interrupted_setup_failure()) is not None:
+        if (failure := self.failure()) is not None:
             _report_unobserved(task, failure)
 
     async def _run_fixture(self) -> None:

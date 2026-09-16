@@ -54,7 +54,7 @@ optional-dependencies.testing = [
   "anyio>=4",
   "coverage[toml]>=6.2",
   "hypothesis>=5.7.1",
-  "pytest-timeout>=2.3",
+  "pytest-timeout>=2.3.1",
   "uvloop>=0.22.1; platform_python_implementation=='CPython' and platform_system!='Windows'",
 ]
 urls."Bug Tracker" = "https://github.com/pytest-dev/pytest-asyncio/issues"
@@ -76,7 +76,7 @@ test = [
   "anyio>=4",
   "coverage[toml]>=6.2",
   "hypothesis>=5.7.1",
-  "pytest-timeout>=2.3",
+  "pytest-timeout>=2.3.1",
   "uvloop>=0.22.1; platform_python_implementation=='CPython' and platform_system!='Windows'",
 ]
 docs = [

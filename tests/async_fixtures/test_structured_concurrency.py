@@ -15,16 +15,7 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11),
-    reason="The experimental runner requires Python 3.11",
-)
-_REQUIRES_312 = pytest.mark.skipif(
-    sys.version_info < (3, 12), reason="asyncio.eager_task_factory needs Python 3.12"
-)
-_REQUIRES_UVLOOP = pytest.mark.skipif(
-    importlib.util.find_spec("uvloop") is None, reason="uvloop is not installed"
-)
+_PYTHON_BEFORE_311 = sys.version_info < (3, 11)
 
 _TASK_GROUPS = [
     pytest.param(
@@ -53,6 +44,7 @@ _TIMEOUTS = [
 _REFUSED = "*This event loop no longer accepts new async tests*"
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_generator_fixture_is_set_up_and_torn_down_in_one_task(pytester: Pytester):
     """A fixture exits a task-bound scope in the task that entered it."""
     pytester.makeini(
@@ -101,6 +93,7 @@ def test_a_failed_assertion_does_not_prevent_later_tests_using_the_same_loop(
     result.stdout.fnmatch_lines(["*AssertionError: reported to pytest*"])
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_cancellation_at_the_end_of_a_fixture_teardown_is_a_teardown_error(
     pytester: Pytester,
 ):
@@ -136,6 +129,7 @@ def test_a_cancellation_at_the_end_of_a_fixture_teardown_is_a_teardown_error(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_child_failing_during_the_fixture_setup_is_a_setup_error(
     pytester: Pytester,
 ):
@@ -175,6 +169,7 @@ def test_a_child_failing_during_the_fixture_setup_is_a_setup_error(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_child_failing_while_a_dependent_fixture_sets_up_cancels_that_setup(
     pytester: Pytester,
 ):
@@ -232,6 +227,7 @@ def test_a_child_failing_while_a_dependent_fixture_sets_up_cancels_that_setup(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_child_failing_during_the_test_cancels_the_test(pytester: Pytester):
     """Issue #1083: cancel the test and report the child's error at fixture teardown."""
     pytester.makeini(
@@ -281,6 +277,7 @@ def test_a_child_failing_during_the_test_cancels_the_test(pytester: Pytester):
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize(("enter_group", "start_child"), _TASK_GROUPS)
 def test_a_child_failing_between_tests_refuses_the_next_test(
     pytester: Pytester, enter_group: str, start_child: str
@@ -330,6 +327,7 @@ def test_a_child_failing_between_tests_refuses_the_next_test(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_an_anyio_task_group_spanning_the_yield_is_exited_by_the_task_that_entered_it(
     pytester: Pytester,
 ):
@@ -361,6 +359,7 @@ def test_an_anyio_task_group_spanning_the_yield_is_exited_by_the_task_that_enter
     result.assert_outcomes(passed=1)
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize(("enter_group", "start_child"), _TASK_GROUPS)
 def test_cancelled_fixture_keeps_resources_available_until_dependent_teardown_finishes(
     pytester: Pytester, enter_group: str, start_child: str
@@ -421,6 +420,7 @@ def test_cancelled_fixture_keeps_resources_available_until_dependent_teardown_fi
     assert not (pytester.path / "cancelled-fixture.txt").exists()
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize(("enter_timeout", "expire_timeout"), _TIMEOUTS)
 def test_a_timeout_spanning_the_yield_expiring_during_the_test_cancels_it(
     pytester: Pytester, enter_timeout: str, expire_timeout: str
@@ -460,6 +460,7 @@ def test_a_timeout_spanning_the_yield_expiring_during_the_test_cancels_it(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize(("enter_timeout", "expire_timeout"), _TIMEOUTS)
 def test_a_timeout_expiring_during_dependent_setup_refuses_later_tests(
     pytester: Pytester, enter_timeout: str, expire_timeout: str
@@ -502,6 +503,7 @@ def test_a_timeout_expiring_during_dependent_setup_refuses_later_tests(
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_parametrized_module_fixtures_can_each_use_an_anyio_task_group(
     pytester: Pytester,
 ):
@@ -534,6 +536,7 @@ def test_parametrized_module_fixtures_can_each_use_an_anyio_task_group(
     result.assert_outcomes(passed=2)
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize("failing", ["first", "second"])
 def test_a_failure_in_either_nested_fixture_group_is_reported_at_teardown(
     pytester: Pytester, failing: str
@@ -613,6 +616,7 @@ def test_a_fixture_that_never_yields_is_a_setup_error(pytester: Pytester):
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_fixture_that_yields_twice_is_a_teardown_error(pytester: Pytester):
     """The second yield is reported at teardown; the tests themselves pass."""
     pytester.makeini(
@@ -647,6 +651,7 @@ def test_a_fixture_that_yields_twice_is_a_teardown_error(pytester: Pytester):
     )
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 @pytest.mark.parametrize(
     "factory",
     [
@@ -656,12 +661,18 @@ def test_a_fixture_that_yields_twice_is_a_teardown_error(pytester: Pytester):
             "    loop.set_task_factory(asyncio.eager_task_factory)\n"
             "    return loop",
             id="eager",
-            marks=_REQUIRES_312,
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 12),
+                reason="asyncio.eager_task_factory needs Python 3.12",
+            ),
         ),
         pytest.param(
             "import uvloop\nfactory = uvloop.new_event_loop",
             id="uvloop",
-            marks=_REQUIRES_UVLOOP,
+            marks=pytest.mark.skipif(
+                importlib.util.find_spec("uvloop") is None,
+                reason="uvloop is not installed",
+            ),
         ),
     ],
 )
@@ -721,6 +732,7 @@ def test_custom_loop_factories_preserve_fixture_failure_reporting(
     assert "never awaited" not in output
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
     pytester: Pytester,
 ):
@@ -763,6 +775,7 @@ def test_a_cancelled_dependent_teardown_does_not_prevent_the_parent_teardown(
     result.stdout.fnmatch_lines(["*RuntimeError: parent cleanup failed*"])
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_fixture_that_has_yielded_is_not_cancelled_by_another_fixture_failure(
     pytester: Pytester,
 ):
@@ -809,6 +822,7 @@ def test_a_fixture_that_has_yielded_is_not_cancelled_by_another_fixture_failure(
     assert (pytester.path / "report.txt").read_text() == "dependent teardown completed"
 
 
+@pytest.mark.skipif(_PYTHON_BEFORE_311, reason="Requires Python 3.11")
 def test_a_fixture_timeout_is_reported_when_the_test_catches_its_cancellation(
     pytester: Pytester,
 ):

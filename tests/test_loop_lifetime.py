@@ -11,9 +11,7 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-_REQUIRES_311 = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
-)
+_PYTHON_BEFORE_311 = sys.version_info < (3, 11)
 
 
 def test_a_custom_loop_remains_current_while_it_closes(pytester: Pytester):
@@ -57,7 +55,9 @@ def test_a_custom_loop_remains_current_while_it_closes(pytester: Pytester):
     result.assert_outcomes(passed=2)
 
 
-@_REQUIRES_311
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_loop_that_cannot_create_tasks_is_closed_and_the_error_reported(
     pytester: Pytester,
 ):
@@ -155,7 +155,9 @@ def test_an_interruption_before_the_first_async_test_still_closes_the_loop(
         assert noise not in output
 
 
-@_REQUIRES_311
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize("task_factory", ["reject_task", "create_one_task"])
 def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
     pytester: Pytester,
@@ -204,7 +206,9 @@ def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
     result.stdout.fnmatch_lines(["*RuntimeError: task creation failed*"])
 
 
-@_REQUIRES_311
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize(
     "statement", ["return", "yield"], ids=["coroutine", "generator"]
 )
@@ -298,7 +302,9 @@ def test_a_loop_factory_failure_is_cached_for_all_fixture_consumers(pytester: Py
     assert not (pytester.path / "fixture-ran.txt").exists()
 
 
-@_REQUIRES_311
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_second_interruption_during_shutdown_still_closes_the_loop(
     pytester: Pytester,
 ):
@@ -333,7 +339,7 @@ def test_a_second_interruption_during_shutdown_still_closes_the_loop(
         import pytest
 
         def interrupt():
-            raise KeyboardInterrupt
+            raise KeyboardInterrupt("during loop shutdown")
 
         @pytest.mark.asyncio
         async def test_interrupted(request):
@@ -343,5 +349,7 @@ def test_a_second_interruption_during_shutdown_still_closes_the_loop(
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret != pytest.ExitCode.OK
-    assert "KeyboardInterrupt" in result.stdout.str() + result.stderr.str()
+    assert "KeyboardInterrupt: during loop shutdown" in (
+        result.stdout.str() + result.stderr.str()
+    )
     assert (pytester.path / "loop-closed.txt").read_text() == "[True]"

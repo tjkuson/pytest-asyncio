@@ -8,14 +8,14 @@ from textwrap import dedent
 import pytest
 from pytest import Pytester
 
-_POSIX = pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
-)
+_PYTHON_BEFORE_311 = sys.version_info < (3, 11)
 _REFUSED = "*This event loop no longer accepts new async tests*"
 _REPORTED_LATE = "Exception from an async fixture or test after pytest stopped waiting"
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize(
     "interrupt",
     [
@@ -24,7 +24,9 @@ _REPORTED_LATE = "Exception from an async fixture or test after pytest stopped w
         pytest.param(
             "loop.call_soon(os.kill, os.getpid(), signal.SIGINT)",
             id="sigint",
-            marks=_POSIX,
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="needs POSIX signals"
+            ),
         ),
     ],
 )
@@ -45,6 +47,8 @@ def test_interrupted_test_finishes_cleanup_before_fixture_teardown(
 
         import pytest
         import pytest_asyncio
+
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
         def interrupt():
             raise KeyboardInterrupt
@@ -81,6 +85,9 @@ def test_interrupted_test_finishes_cleanup_before_fixture_teardown(
     assert (pytester.path / "output.txt").read_text() == "test output"
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_second_interruption_stops_waiting_for_the_cleanup(pytester: Pytester):
     """Cancellation of the abandoned cleanup still lets it save its partial result."""
     pytester.makeini(
@@ -126,6 +133,9 @@ def test_a_second_interruption_stops_waiting_for_the_cleanup(pytester: Pytester)
         assert noise not in result.stdout.str() + result.stderr.str()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_an_error_raised_after_the_second_interruption_is_reported_once(
     pytester: Pytester,
 ):
@@ -170,6 +180,9 @@ def test_an_error_raised_after_the_second_interruption_is_reported_once(
     result.stdout.fnmatch_lines(["*RuntimeError: abandoned cleanup failed*"])
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize("error_type", ["AssertionError", "FalseError"])
 def test_a_cleanup_error_is_reported_instead_of_the_interruption(
     pytester: Pytester, error_type: str
@@ -216,6 +229,9 @@ def test_a_cleanup_error_is_reported_instead_of_the_interruption(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_test_suppressing_the_cancellation_does_not_suppress_the_interruption(
     pytester: Pytester,
 ):
@@ -257,6 +273,9 @@ def test_a_test_suppressing_the_cancellation_does_not_suppress_the_interruption(
     result.assert_outcomes()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_an_interruption_makes_one_cancellation_request_on_the_test_task(
     pytester: Pytester,
 ):
@@ -284,14 +303,16 @@ def test_an_interruption_makes_one_cancellation_request_on_the_test_task(
 
             request.addfinalizer(check_cancelled_task)
             asyncio.get_running_loop().call_soon(interrupt)
-            child = asyncio.create_task(asyncio.Event().wait())
-            await child
+            await asyncio.Event().wait()
         """))
     result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
     assert result.ret == pytest.ExitCode.INTERRUPTED
     result.assert_outcomes()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_loop_stopped_after_the_test_returned_does_not_refuse_later_tests(
     pytester: Pytester,
 ):
@@ -325,6 +346,9 @@ def test_a_loop_stopped_after_the_test_returned_does_not_refuse_later_tests(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup(
     pytester: Pytester,
 ):
@@ -380,6 +404,9 @@ def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 @pytest.mark.parametrize(
     "interrupt",
     [
@@ -387,7 +414,9 @@ def test_a_fixture_failing_while_the_interrupted_test_cleans_up_ends_the_cleanup
         pytest.param(
             "loop.call_soon(os.kill, os.getpid(), signal.SIGINT)",
             id="sigint",
-            marks=_POSIX,
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="needs POSIX signals"
+            ),
         ),
     ],
 )
@@ -407,6 +436,8 @@ def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
 
         import pytest
         import pytest_asyncio
+
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
         def interrupt():
             raise KeyboardInterrupt
@@ -436,6 +467,9 @@ def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_teardown_error_settled_as_the_second_interruption_arrives_is_reported_once(
     pytester: Pytester,
 ):
@@ -481,6 +515,9 @@ def test_a_teardown_error_settled_as_the_second_interruption_arrives_is_reported
         assert noise not in result.stdout.str() + result.stderr.str()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
     pytester: Pytester,
 ):
@@ -524,10 +561,12 @@ def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
     assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
 
 
-@_POSIX
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
 def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
     """The timed-out test can save its result, and the shared loop serves the next."""
-    pytest.importorskip("pytest_timeout")
     pytester.makeini(
         "[pytest]\n"
         "experimental_asyncio_task_group_runner = true\n"
@@ -559,17 +598,21 @@ def test_pytest_timeout_fails_a_test_hung_at_an_await(pytester: Pytester):
             pass
         """))
     result = pytester.runpytest_subprocess(
-        "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
+        "--asyncio-mode=strict",
+        "-p",
+        "timeout",
+        "-o",
+        "timeout_method=signal",
+        timeout=30,
     )
     result.assert_outcomes(failed=1, passed=1)
     result.stdout.fnmatch_lines(["*_ test_hang _*", "*Failed: Timeout*0.5s*"])
     assert (pytester.path / "report.txt").read_text() == "partial result"
 
 
-@_POSIX
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
 def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
     """The signal fails the test from its own frame; the loop serves the next test."""
-    pytest.importorskip("pytest_timeout")
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import pytest
@@ -585,12 +628,20 @@ def test_pytest_timeout_fails_a_test_hung_in_a_busy_loop(pytester: Pytester):
             pass
         """))
     result = pytester.runpytest_subprocess(
-        "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
+        "--asyncio-mode=strict",
+        "-p",
+        "timeout",
+        "-o",
+        "timeout_method=signal",
+        timeout=30,
     )
     result.assert_outcomes(failed=1, passed=1)
     result.stdout.fnmatch_lines(["*_ test_hang _*", "*Failed: Timeout*0.5s*"])
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
     pytester: Pytester,
 ):
@@ -631,6 +682,9 @@ def test_a_fixture_interrupted_after_it_yielded_is_torn_down_before_its_parent(
     assert (pytester.path / "report.txt").read_text() == "report contents"
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_setup_that_recovers_from_the_interruption_and_yields_is_torn_down(
     pytester: Pytester,
 ):
@@ -675,6 +729,9 @@ def test_a_fixture_setup_that_recovers_from_the_interruption_and_yields_is_torn_
     assert (pytester.path / "report.txt").read_text() == "report contents"
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
     pytester: Pytester,
 ):
@@ -716,6 +773,9 @@ def test_a_teardown_error_of_a_fixture_pytest_never_received_is_reported(
     )
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_fixture_setup_abandoned_by_a_second_interruption_reports_no_error(
     pytester: Pytester,
 ):
@@ -823,6 +883,9 @@ def test_fixture_setup_returning_without_yield_reports_a_pending_keyboard_interr
     assert "StopAsyncIteration" not in result.stdout.str()
 
 
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
 def test_a_teardown_interrupted_before_it_starts_does_not_refuse_later_tests(
     pytester: Pytester,
 ):
@@ -868,12 +931,14 @@ def test_a_teardown_interrupted_before_it_starts_does_not_refuse_later_tests(
     assert (pytester.path / "closed.txt").read_text() == "closed"
 
 
-@_POSIX
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
 def test_a_cleanup_failure_retains_the_timeout_that_cancelled_the_test(
     pytester: Pytester,
 ):
     """A cleanup error includes the timeout which caused cleanup to start."""
-    pytest.importorskip("pytest_timeout")
     pytester.makeini(
         "[pytest]\n"
         "experimental_asyncio_task_group_runner = true\n"
@@ -897,7 +962,12 @@ def test_a_cleanup_failure_retains_the_timeout_that_cancelled_the_test(
             pass
         """))
     result = pytester.runpytest_subprocess(
-        "--asyncio-mode=strict", "-o", "timeout_method=signal", timeout=30
+        "--asyncio-mode=strict",
+        "-p",
+        "timeout",
+        "-o",
+        "timeout_method=signal",
+        timeout=30,
     )
     result.assert_outcomes(failed=1, passed=1)
     result.stdout.fnmatch_lines(

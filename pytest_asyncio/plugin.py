@@ -80,6 +80,10 @@ _R = TypeVar("_R", bound=Awaitable | AsyncIterable | AsyncIterator)
 _P = ParamSpec("_P")
 FixtureFunction = Callable[_P, _R]
 LoopFactory: TypeAlias = Callable[[], AbstractEventLoop]
+AsyncGenFixtureParams = ParamSpec("AsyncGenFixtureParams")
+AsyncGenFixtureYieldType = TypeVar("AsyncGenFixtureYieldType")
+AsyncFixtureParams = ParamSpec("AsyncFixtureParams")
+AsyncFixtureReturnType = TypeVar("AsyncFixtureReturnType")
 
 
 class PytestAsyncioError(Exception):
@@ -446,10 +450,6 @@ def _wrap_sync_fixture(
     return _sync_fixture_wrapper
 
 
-AsyncGenFixtureParams = ParamSpec("AsyncGenFixtureParams")
-AsyncGenFixtureYieldType = TypeVar("AsyncGenFixtureYieldType")
-
-
 def _wrap_asyncgen_fixture(
     fixture_function: Callable[
         AsyncGenFixtureParams, AsyncGeneratorType[AsyncGenFixtureYieldType, Any]
@@ -497,10 +497,6 @@ def _wrap_asyncgen_fixture(
         return result
 
     return _asyncgen_fixture_wrapper
-
-
-AsyncFixtureParams = ParamSpec("AsyncFixtureParams")
-AsyncFixtureReturnType = TypeVar("AsyncFixtureReturnType")
 
 
 def _wrap_async_fixture(
@@ -579,7 +575,7 @@ def _cancelled_fixture_error(
     # Translate only at pytest's boundary: it must cache setup errors and
     # continue other finalizers. The fixture's native task stays cancelled.
     msg = f"The {phase} of async fixture {name!r} was cancelled."
-    if test_runner.refusal_reason is not None:
+    if phase == "setup" and test_runner.refusal_reason is not None:
         msg += " " + test_runner.refusal_reason
     return PytestAsyncioError(msg)
 
@@ -656,7 +652,8 @@ def _wrap_task_group_async_fixture(
 def _apply_task_group_contextvar_changes(
     fixture_context: contextvars.Context,
 ) -> Callable[[], None]:
-    """Expose fixture changes to dependents and return their reset finalizer."""
+    """Expose the fixture's context to dependents and return its reset finalizer."""
+    # A task factory can change the synchronous context during fixture setup.
     current_context = contextvars.copy_context()
     tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
     for var, value in fixture_context.items():
@@ -1229,7 +1226,7 @@ def _get_task_group_runner(loop_owner: TaskGroupLoopOwner) -> TaskGroupRunner:
 
 
 def _close_with_warning(resource: Runner | TaskGroupLoopOwner) -> None:
-    """Preserve the existing warning policy for failed loop-scope cleanup."""
+    """Warn if closing the loop scope raises RuntimeError."""
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", ".*BaseEventLoop.shutdown_asyncgens.*", RuntimeWarning
