@@ -14,7 +14,7 @@ The *loop_scope* of a fixture can be chosen independently from its caching *scop
 However, the event loop scope must be larger or the same as the fixture's caching scope.
 In other words, it's possible to reevaluate an async fixture multiple times within the same event loop, but it's not possible to switch out the running event loop in an async fixture.
 
-For task groups and cancellation scopes spanning a fixture's ``yield``, see :ref:`configuration/experimental_asyncio_task_group_runner`.
+For task groups and cancel scopes spanning a fixture's ``yield``, see :ref:`configuration/experimental_asyncio_task_group_runner`.
 
 Examples:
 

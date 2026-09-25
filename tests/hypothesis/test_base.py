@@ -136,7 +136,7 @@ def test_experimental_runner_isolates_context_variables_between_examples(
 @pytest.mark.skipif(
     sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
 )
-def test_examples_keep_fixture_context_when_task_factory_changes_calling_context(
+def test_examples_keep_fixture_context_when_factory_assigns_after_task_creation(
     pytester: Pytester,
 ):
     """A task factory's assignment does not leak into later Hypothesis examples."""
@@ -153,7 +153,7 @@ def test_examples_keep_fixture_context_when_task_factory_changes_calling_context
         import pytest_asyncio
         from hypothesis import example, given, settings, strategies as st
 
-        request_id = ContextVar("request_id", default="initial")
+        request_id = ContextVar("request_id")
 
         @pytest_asyncio.fixture
         async def task_factory():
@@ -180,7 +180,6 @@ def test_examples_keep_fixture_context_when_task_factory_changes_calling_context
         @given(value=st.booleans())
         async def test_example(value):
             assert request_id.get() == "fixture"
-            request_id.set("example")
         """))
 
     result = pytester.runpytest("--asyncio-mode=strict")

@@ -1226,7 +1226,7 @@ def _get_task_group_runner(loop_owner: TaskGroupLoopOwner) -> TaskGroupRunner:
 
 
 def _close_with_warning(resource: Runner | TaskGroupLoopOwner) -> None:
-    """Warn if closing the loop scope raises RuntimeError."""
+    """Turn a RuntimeError from closing the loop scope into a warning."""
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", ".*BaseEventLoop.shutdown_asyncgens.*", RuntimeWarning

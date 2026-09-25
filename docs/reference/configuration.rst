@@ -85,9 +85,9 @@ Cancellation and cleanup
 ------------------------
 
 If a fixture is cancelled while in use, any async test or async fixture setup still running on its loop is cancelled too.
-Further async tests and fixture setups cannot run on that loop, including tests that do not use the cancelled fixture.
+Later async tests and fixture setups cannot run on that loop, including tests that do not use the cancelled fixture.
 Fixture teardown still follows pytest's usual order.
-Further cancellation can interrupt cleanup that awaits.
+Additional cancellation can interrupt cleanup that awaits.
 
 Pytest reports unhandled cancellation as a test failure or a fixture setup or teardown error.
 If a task group or timeout fails while its fixture is suspended at ``yield``, pytest reports the error at fixture teardown.
@@ -109,7 +109,7 @@ The experimental runner preserves :ref:`fixture context propagation and test iso
 Each Hypothesis example also gets a fresh context; the default runner shares a context between examples of one test.
 Custom task factories that modify context variables may produce different values with the two runners.
 
-A cancelled AnyIO scope spanning ``yield`` can repeatedly cancel its fixture while it waits for teardown, consuming CPU.
+A cancelled AnyIO cancel scope spanning ``yield`` can repeatedly cancel its fixture while it waits for teardown, consuming CPU.
 
 Code inspecting a test task's exception may not see failures reported by pytest.
 Pytest-asyncio also manages internal tasks that may appear in ``asyncio.all_tasks()``.

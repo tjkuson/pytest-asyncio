@@ -1206,7 +1206,7 @@ requires-dist = [
     { name = "coverage", extras = ["toml"], marker = "extra == 'testing'", specifier = ">=6.2" },
     { name = "hypothesis", marker = "extra == 'testing'", specifier = ">=5.7.1" },
     { name = "pytest", specifier = ">=8.4,<10" },
-    { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.3.1" },
+    { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.3" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=5.3" },
     { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = ">=1" },
     { name = "sphinx-tabs", marker = "extra == 'docs'", specifier = ">=3.5" },
@@ -1230,7 +1230,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pyright", extras = ["nodejs"] },
     { name = "pytest" },
-    { name = "pytest-timeout", specifier = ">=2.3.1" },
+    { name = "pytest-timeout", specifier = ">=2.3" },
     { name = "sphinx", specifier = ">=5.3" },
     { name = "sphinx-rtd-theme", specifier = ">=1" },
     { name = "sphinx-tabs", specifier = ">=3.5" },
@@ -1246,7 +1246,7 @@ test = [
     { name = "anyio", specifier = ">=4" },
     { name = "coverage", extras = ["toml"], specifier = ">=6.2" },
     { name = "hypothesis", specifier = ">=5.7.1" },
-    { name = "pytest-timeout", specifier = ">=2.3.1" },
+    { name = "pytest-timeout", specifier = ">=2.3" },
     { name = "uvloop", marker = "platform_python_implementation == 'CPython' and sys_platform != 'win32'", specifier = ">=0.22.1" },
 ]
 typing = [

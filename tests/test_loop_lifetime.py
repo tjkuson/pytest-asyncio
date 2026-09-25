@@ -206,9 +206,6 @@ def test_sync_fixture_can_use_its_loop_during_teardown_after_task_startup_fails(
     result.stdout.fnmatch_lines(["*RuntimeError: task creation failed*"])
 
 
-@pytest.mark.skipif(
-    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
-)
 @pytest.mark.parametrize(
     "statement", ["return", "yield"], ids=["coroutine", "generator"]
 )

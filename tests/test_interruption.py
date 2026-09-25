@@ -48,6 +48,7 @@ def test_interrupted_test_finishes_cleanup_before_fixture_teardown(
         import pytest
         import pytest_asyncio
 
+        # The parent process may ignore SIGINT.
         signal.signal(signal.SIGINT, signal.default_int_handler)
 
         def interrupt():
@@ -224,6 +225,54 @@ def test_a_cleanup_error_is_reported_instead_of_the_interruption(
         [
             "*_ test_query _*",
             f"*{error_type}: cleanup bug*",
+            "*Raised during cleanup*KeyboardInterrupt()*",
+        ]
+    )
+
+
+@pytest.mark.skipif(
+    _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
+)
+def test_an_interrupted_fixture_setup_reports_its_cleanup_error(pytester: Pytester):
+    """The cleanup error becomes a setup error instead of ending the session."""
+    pytester.makeini(
+        "[pytest]\n"
+        "experimental_asyncio_task_group_runner = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+        import asyncio
+
+        import pytest
+        import pytest_asyncio
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        @pytest_asyncio.fixture
+        async def resource():
+            asyncio.get_running_loop().call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+                yield
+            finally:
+                raise ValueError("fixture setup cleanup failed")
+
+        @pytest.mark.asyncio
+        async def test_query(resource):
+            pytest.fail("fixture setup should have failed")
+
+        @pytest.mark.asyncio
+        async def test_next():
+            pass
+        """))
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    result.assert_outcomes(errors=1, passed=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_query*",
+            "*ValueError: fixture setup cleanup failed*",
             "*Raised during cleanup*KeyboardInterrupt()*",
         ]
     )
@@ -437,6 +486,7 @@ def test_an_interrupted_fixture_teardown_is_cancelled_and_finished(
         import pytest
         import pytest_asyncio
 
+        # The parent process may ignore SIGINT.
         signal.signal(signal.SIGINT, signal.default_int_handler)
 
         def interrupt():
@@ -518,10 +568,10 @@ def test_a_teardown_error_settled_as_the_second_interruption_arrives_is_reported
 @pytest.mark.skipif(
     _PYTHON_BEFORE_311, reason="The experimental runner requires Python 3.11"
 )
-def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
+def test_a_fixture_yielding_after_abandoned_setup_is_closed_and_reports_its_error_once(
     pytester: Pytester,
 ):
-    """An interrupted finalizer leaves the fixture to the closing of the loop."""
+    """Loop shutdown closes a fixture whose setup pytest stopped waiting for."""
     pytester.makeini(
         "[pytest]\n"
         "experimental_asyncio_task_group_runner = true\n"
@@ -529,36 +579,40 @@ def test_a_fixture_pytest_could_not_finalize_is_closed_in_its_own_task(
     )
     pytester.makepyfile(dedent("""\
         import asyncio
-        from io import StringIO
-        from pathlib import Path
 
         import pytest
         import pytest_asyncio
 
+        def interrupt():
+            raise KeyboardInterrupt
+
         @pytest_asyncio.fixture
         async def resource():
-            task = asyncio.current_task()
-            with StringIO("report contents") as report:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(interrupt)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                loop.call_soon(interrupt)
                 try:
-                    yield report
-                finally:
-                    await asyncio.sleep(0)
-                    assert asyncio.current_task() is task
-                    Path("report.txt").write_text(report.getvalue())
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
+            try:
+                yield
+            finally:
+                raise ValueError("abandoned fixture cleanup failed")
 
         @pytest.mark.asyncio
-        async def test_it(resource, request):
-            def interrupt():
-                raise KeyboardInterrupt
-
-            request.node.addfinalizer(interrupt)
+        async def test_it(resource):
+            pytest.fail("fixture setup should have been interrupted")
         """))
     result = pytester.runpytest_subprocess(
-        "--asyncio-mode=strict", "-W", "error", timeout=30
+        "--asyncio-mode=strict", "-W", "error", "-o", "log_cli=true", timeout=30
     )
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert (pytester.path / "report.txt").read_text() == "report contents"
-    assert "Task was destroyed" not in result.stdout.str() + result.stderr.str()
+    assert result.stdout.str().count(_REPORTED_LATE) == 1
+    result.stdout.fnmatch_lines(["*ValueError: abandoned fixture cleanup failed*"])
 
 
 @pytest.mark.skipif(

@@ -122,8 +122,8 @@ class TaskGroupRunner:
             raise RuntimeError(self._refusal_reason)
         fixture = FixtureTask(
             gen,
-            lambda live: self._task_group_host.create_task(
-                live, context=context, name=name
+            lambda coro: self._task_group_host.create_task(
+                coro, context=context, name=name
             ),
             loop=self.get_loop(),
             refuse_new_work=lambda: self._refuse_new_work(
@@ -142,7 +142,7 @@ class TaskGroupRunner:
                     fixture.task, fixture.report_unobserved, ready=fixture.ready
                 )
         # Pytest never receives an interrupted fixture. End it here while its
-        # dependencies still exist, tearing down a recovered setup normally.
+        # dependencies still exist.
         if fixture.yielded:
             fixture.request_teardown()
             self._join_or_abandon(fixture.task, fixture.report_unobserved)
@@ -179,7 +179,7 @@ class TaskGroupRunner:
         Drive the loop until the cancelled task ends.
 
         A second interruption stops waiting: the task is cancelled again and
-        left to end on its own, ``unobserved`` reports what it ends with, and
+        left to end on its own, ``unobserved`` reports captured failures, and
         close cancels it once more. A setup's ``ready`` also ends the wait:
         a cancelled setup that recovers and yields parks its task there.
         """
@@ -284,7 +284,7 @@ class _TaskGroupHost:
         context: contextvars.Context,
         name: str,
     ) -> asyncio.Task[_T]:
-        # Hypothesis reuses the supplied context for each example.
+        # Keep factory assignments out of the context reused by Hypothesis.
         task = context.copy().run(self._group.create_task, coro)
         task.set_name(name)
         return task
@@ -434,6 +434,7 @@ class FixtureTask(Generic[_T]):
 
     def report_unobserved(self, task: asyncio.Task[object]) -> None:
         """A done callback for a fixture nobody reads: report an exception."""
+        # An abandoned setup may also be observed during loop shutdown.
         if self._reported:
             return
         self._reported = True
