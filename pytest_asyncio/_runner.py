@@ -328,11 +328,12 @@ class FixtureTask(Generic[_T]):
             except asyncio.CancelledError as exc:
                 # Hold the cancellation until pytest tears the fixture down:
                 # delivering it now would close resources that the cancelled
-                # test's cleanup and dependent teardown still use. Teardown
-                # throws the first one in at the yield. Later ones, such as
-                # AnyIO's repeats, are not uncancelled: as when several reach
-                # a task before it resumes, they stay pending, so each scope
-                # unwinding at the yield sees whether another also cancelled it.
+                # test's cleanup and dependent teardown still use. As
+                # asyncio.TaskGroup does while it waits for its tasks, keep the
+                # first one to throw in at the yield, and leave later ones,
+                # such as AnyIO's repeats, pending rather than uncancelled, so
+                # each scope unwinding at the yield sees whether another also
+                # cancelled it.
                 if cancellation is not None:
                     continue
                 # Thrown in at the yield, it should not carry the frames of
@@ -364,7 +365,11 @@ class _Outcome(Generic[_T]):
     asyncio re-raises those two out of the event loop from the middle of an
     iteration, before the task's done callbacks run. There they would pass for
     an interruption from outside the task. Held here, they stay the function's
-    own error; any other exception, and cancellation, stays the task's.
+    own error. An exception that a task factory's wrapper raises after the
+    function ends is reported instead, with the held one as its context. A
+    cancellation of the task is not: once held, the exception cannot be told
+    apart from one raised while a cancellation was pending, and natively such
+    an exception wins over the pending cancellation.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:

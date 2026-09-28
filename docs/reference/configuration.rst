@@ -112,18 +112,6 @@ Limitations
 
 Cancel only tasks that your code created: cancelling tasks that pytest-asyncio uses, for example every task in ``asyncio.all_tasks()``, can fail a test or fixture, cut its cleanup short, or make code that then waits for those tasks hang.
 
-A fixture can miss a cancellation if it has an AnyIO cancel scope inside an asyncio task group or ``asyncio.timeout()``, both around ``yield``, and the AnyIO scope is cancelled while the fixture is in use, for example by the deadline of ``anyio.move_on_after()``.
-If the asyncio task group or timeout is then triggered before the fixture is torn down, the fixture does not receive that cancellation.
-The timeout's ``TimeoutError`` can then be missing from the report.
-An async test that is running when the AnyIO scope is cancelled fails, because that cancellation also cancels it.
-If both scopes are triggered after the test has finished, for example during the slow teardown of a dependent fixture, the test can pass with no error.
-Teardown can also hang if cleanup waits for work that the task group's failed task will never do, for example by calling ``join()`` on a queue that the task consumed.
-Pressing Ctrl-C ends the hang.
-pytest-timeout does not time teardown after a failed test, whichever method it uses, so it cannot end a hang in that teardown.
-To limit such hangs, set a timeout for the whole run, such as your CI job's timeout.
-
-With the nesting reversed, an ``asyncio.timeout()`` inside an AnyIO cancel scope, the fixture's teardown can fail with a cancellation error instead of the timeout's ``TimeoutError``.
-AnyIO scopes that libraries open and close within a call are not affected, nor are fixtures that nest only AnyIO scopes or only asyncio ones.
-To avoid these problems, use AnyIO for both scopes, or cancel the AnyIO scope only after ``yield``, during teardown.
-
-While a fixture whose AnyIO cancel scope was cancelled waits for teardown, AnyIO keeps cancelling it, which uses CPU whenever other code runs on its event loop, such as the teardown of its dependents.
+If a fixture nests AnyIO cancel scopes and asyncio task groups or ``asyncio.timeout()`` around ``yield``, and both kinds are triggered while the fixture is in use, AnyIO bugs can lose or misreport a cancellation: a ``TimeoutError`` can go missing, or teardown can hang or fail with ``CancelledError``.
+AnyIO releases after 4.15.1 fix the more serious of these, `anyio#1214 <https://github.com/agronholm/anyio/issues/1214>`__.
+Fixtures that use only AnyIO scopes, or only asyncio ones, are not affected.

@@ -158,7 +158,7 @@ Unwinding the fixture at that point would close resources they are using, so pyt
 * The fixture receives the cancellation at ``yield`` when pytest tears it down, after the fixtures that depend on it.
   Context managers and ``finally`` blocks run, but other statements after ``yield`` are skipped unless the fixture handles the cancellation.
   The task group's or timeout's error is reported as an error at the fixture's teardown.
-  One combination of AnyIO and asyncio scopes is an exception; see the option's :ref:`limitations <configuration/asyncio_experimental_task_per_fixture/limitations>`.
+  Some fixtures that nest AnyIO cancel scopes and asyncio task groups or timeouts are an exception; see the option's :ref:`limitations <configuration/asyncio_experimental_task_per_fixture/limitations>`.
 
 In the example, if a heartbeat write fails, the test is cancelled.
 When pytest tears down the fixture, the ``finally`` block, the task group and the ``with`` statement clean up, and pytest reports the write error.

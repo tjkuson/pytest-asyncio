@@ -308,3 +308,46 @@ def test_a_cancelled_dependent_teardown_does_not_prevent_its_parent_teardown(
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(["*PytestAsyncioError: *'dependent' was cancelled*"])
     result.stdout.fnmatch_lines(["*RuntimeError: parent cleanup failed*"])
+
+
+def test_a_fixture_cancelled_twice_while_held_receives_the_first_cancellation(
+    pytester: Pytester,
+):
+    """As with asyncio.TaskGroup, the first cancellation is raised at the yield."""
+    pytester.makeini(
+        "[pytest]\n"
+        "asyncio_experimental_task_per_fixture = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        from pathlib import Path
+
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def parent():
+            try:
+                yield asyncio.current_task()
+            except asyncio.CancelledError as cancelled:
+                Path("received.txt").write_text(repr(cancelled.args))
+                raise
+
+        @pytest_asyncio.fixture
+        async def dependent(parent):
+            yield
+            parent.cancel("first")
+            await asyncio.sleep(0)
+            parent.cancel("second")
+            await asyncio.sleep(0)
+
+        @pytest.mark.asyncio
+        async def test_uses_dependent(dependent):
+            pass
+        """))
+
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+
+    result.assert_outcomes(passed=1, errors=1)
+    assert (pytester.path / "received.txt").read_text() == "('first',)"
