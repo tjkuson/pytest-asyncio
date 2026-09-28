@@ -1,0 +1,1 @@
+Added test dependencies on ``anyio >= 4``, ``pytest-timeout >= 2.3`` and, on CPython outside Windows, ``uvloop >= 0.22.1``. The ``coverage`` test dependency now includes its ``toml`` extra (``coverage[toml] >= 6.2``).

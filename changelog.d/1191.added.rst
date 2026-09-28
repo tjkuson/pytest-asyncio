@@ -1,0 +1,4 @@
+Added the experimental :ref:`asyncio_experimental_task_per_fixture <configuration/asyncio_experimental_task_per_fixture>` option for Python 3.11 and later.
+It runs each async fixture in one task from setup to teardown, so task groups, timeouts and AnyIO cancel scopes can stay open across an async generator fixture's ``yield``.
+When such a task group's background task fails or such a timeout expires, the running test is cancelled and the error is reported at the fixture's teardown, instead of being lost or making teardown hang.
+Some fixtures that nest AnyIO cancel scopes and asyncio task groups or timeouts are an exception; see :ref:`the option's limitations <configuration/asyncio_experimental_task_per_fixture/limitations>`.

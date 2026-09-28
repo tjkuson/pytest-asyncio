@@ -1,4 +1,4 @@
-"""Fixture requests made from running async tests."""
+"""Async fixtures and tests requested while an event loop is already running."""
 
 from __future__ import annotations
 
@@ -9,29 +9,33 @@ import pytest
 from pytest import Pytester
 
 
-@pytest.mark.parametrize(
-    "statement", ["return", "yield"], ids=["coroutine", "generator"]
-)
-def test_session_loop_remains_usable_after_rejected_async_fixture_request(
-    pytester: Pytester, statement: str
+def test_an_async_fixture_requested_by_a_running_test_is_refused_without_harm(
+    pytester: Pytester,
 ):
-    """Rejection leaves later tests using the requested loop scope unaffected."""
+    """The fixture does not start, and later tests can use its loop."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent(f"""\
+    pytester.makepyfile(dedent("""\
         from pathlib import Path
 
         import pytest
         import pytest_asyncio
 
         @pytest_asyncio.fixture(scope="session", loop_scope="session")
-        async def value():
+        async def returned():
             Path("fixture-started").touch()
-            {statement} 42
+            return 42
+
+        @pytest_asyncio.fixture(scope="session", loop_scope="session")
+        async def yielded():
+            Path("fixture-started").touch()
+            yield 42
 
         @pytest.mark.asyncio
-        async def test_rejects_new_async_setup(request):
+        async def test_requests_new_async_setups(request):
             with pytest.raises(RuntimeError, match="event loop is running"):
-                request.getfixturevalue("value")
+                request.getfixturevalue("returned")
+            with pytest.raises(RuntimeError, match="event loop is running"):
+                request.getfixturevalue("yielded")
 
         @pytest.mark.asyncio(loop_scope="session")
         async def test_session_loop_is_usable():
@@ -71,29 +75,31 @@ def test_repeated_async_fixture_requests_report_the_original_setup_error(
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.parametrize(
-    "statement", ["return", "yield"], ids=["function", "generator"]
-)
-def test_async_test_can_set_up_sync_fixture_with_a_new_session_loop(
-    pytester: Pytester, statement: str
+def test_an_async_test_can_set_up_sync_fixtures_of_a_loop_not_yet_created(
+    pytester: Pytester,
 ):
-    """Synchronous setup does not need to run the fixture's configured loop."""
+    """Setting up a sync fixture does not need to run its configured loop."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent(f"""\
+    pytester.makepyfile(dedent("""\
         import pytest
         import pytest_asyncio
 
         @pytest_asyncio.fixture(scope="session", loop_scope="session")
-        def value():
-            {statement} 42
+        def returned():
+            return 42
+
+        @pytest_asyncio.fixture(scope="session", loop_scope="session")
+        def yielded():
+            yield 42
 
         @pytest.mark.asyncio
-        async def test_requests_sync_fixture(request):
-            assert request.getfixturevalue("value") == 42
+        async def test_requests_sync_fixtures(request):
+            assert request.getfixturevalue("returned") == 42
+            assert request.getfixturevalue("yielded") == 42
 
         @pytest.mark.asyncio(loop_scope="session")
-        async def test_uses_the_fixture_on_its_session_loop(value):
-            assert value == 42
+        async def test_uses_the_fixtures_on_their_loop(returned, yielded):
+            assert returned == yielded == 42
         """))
     result = pytester.runpytest_subprocess(
         "--asyncio-mode=strict", "-W", "error", timeout=30
@@ -152,7 +158,10 @@ def test_async_tests_in_a_running_loop_report_setup_errors_without_coroutine_war
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(
-        ["*RuntimeError: pytest-asyncio cannot run async tests*running event loop*"]
+        [
+            "*RuntimeError: pytest-asyncio cannot start async test 'test_async' "
+            "while an event loop is running*"
+        ]
     )
     output = result.stdout.str() + result.stderr.str()
     assert "never awaited" not in output

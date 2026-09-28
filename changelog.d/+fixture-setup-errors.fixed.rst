@@ -1,0 +1,2 @@
+Fixed a bare ``AssertionError`` reported for each test after the first that used a shared async fixture whose event loop could not be created, for example because a loop factory raised an exception. Each of these tests now reports the original error.
+As a side effect, ``--setup-plan`` can omit or misplace pytest-asyncio's internal event loop fixtures; ``--setup-show`` and test runs are unaffected.

@@ -1,0 +1,1 @@
+Fixed confusing errors and "coroutine ... was never awaited" warnings when an async test or async fixture was started while an event loop was already running, for example when an async test called ``request.getfixturevalue()`` for an async fixture. pytest-asyncio now raises a ``RuntimeError`` that explains the problem, and reports such async tests as setup errors.

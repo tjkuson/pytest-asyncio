@@ -226,10 +226,10 @@ def test_isolation_against_context_changes_in_async_tests(
     result.assert_outcomes(passed=2)
 
 
-def test_a_sync_fixture_assignment_is_seen_and_restored_on_a_reused_loop(
+def test_a_sync_fixture_assignment_is_seen_by_async_tests_however_old_their_loop(
     pytester: Pytester,
 ):
-    """The fixture may run before the shared loop is created, or after."""
+    """A shared loop created before or after the sync fixture sees its value."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         from contextvars import ContextVar
@@ -267,10 +267,10 @@ def test_a_sync_fixture_assignment_is_seen_and_restored_on_a_reused_loop(
     result.assert_outcomes(passed=4)
 
 
-def test_a_sync_test_assignment_is_seen_by_later_async_tests_on_a_shared_loop(
+def test_a_sync_test_assignment_is_seen_by_later_async_tests_however_old_their_loop(
     pytester: Pytester,
 ):
-    """Each test's task starts from the current context, however old its loop."""
+    """An async test on a loop created before the assignment still sees it."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         from contextvars import ContextVar
@@ -298,7 +298,7 @@ def test_a_sync_test_assignment_is_seen_by_later_async_tests_on_a_shared_loop(
 def test_a_test_assignment_does_not_change_its_fixtures_teardown_context(
     pytester: Pytester,
 ):
-    """The fixture still sees its own value, and resets it in its own context."""
+    """The fixture's teardown sees its own value, and can reset its own token."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         from contextvars import ContextVar
@@ -391,6 +391,34 @@ def test_a_fixture_assigning_the_same_object_again_propagates_it_again(
     result.assert_outcomes(passed=2)
 
 
+def test_an_async_coroutine_fixture_assignment_is_undone_after_its_test(
+    pytester: Pytester,
+):
+    """A later test does not see the value that a returning async fixture set."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""
+        from contextvars import ContextVar
+
+        import pytest
+        import pytest_asyncio
+
+        _context_var = ContextVar("context_var")
+
+        @pytest_asyncio.fixture
+        async def var_fixture():
+            _context_var.set("value")
+
+        def test_uses_var(var_fixture):
+            assert _context_var.get() == "value"
+
+        def test_after():
+            with pytest.raises(LookupError):
+                _context_var.get()
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
 def test_an_async_fixture_context_is_restored_in_sync_code_when_its_teardown_fails(
     pytester: Pytester,
 ):
@@ -426,6 +454,40 @@ def test_an_async_fixture_context_is_restored_in_sync_code_when_its_teardown_fai
     result.stdout.fnmatch_lines(
         ["*var reset in the synchronous context", "*ValueError: teardown error*"]
     )
+
+
+def test_tasks_and_callbacks_started_by_a_test_see_its_fixture_values(
+    pytester: Pytester,
+):
+    """Child tasks and loop callbacks inherit the context the test runs in."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makepyfile(dedent("""
+        import asyncio
+        from contextvars import ContextVar
+
+        import pytest
+        import pytest_asyncio
+
+        _context_var = ContextVar("context_var")
+
+        @pytest_asyncio.fixture
+        async def var_fixture():
+            _context_var.set("fixture value")
+            yield
+
+        async def read_var():
+            return _context_var.get()
+
+        @pytest.mark.asyncio
+        async def test(var_fixture):
+            loop = asyncio.get_running_loop()
+            from_callback = loop.create_future()
+            loop.call_soon(lambda: from_callback.set_result(_context_var.get()))
+            assert await asyncio.create_task(read_var()) == "fixture value"
+            assert await from_callback == "fixture value"
+        """))
+    result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=1)
 
 
 @pytest.mark.skipif(
@@ -465,76 +527,14 @@ def test_the_current_task_context_is_the_context_of_the_fixture_or_test(
 
 
 @pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
-)
-def test_a_task_factory_context_is_seen_by_the_fixture_its_sync_dependent_and_the_test(
-    pytester: Pytester,
-):
-    """The task factory's context value propagates through fixtures to the test."""
-    pytester.makeini(
-        "[pytest]\n"
-        "experimental_asyncio_task_group_runner = true\n"
-        "asyncio_default_fixture_loop_scope = function"
-    )
-    pytester.makeconftest(dedent("""\
-        import asyncio
-        import contextvars
-
-        import pytest
-
-        _trace = contextvars.ContextVar("trace")
-
-        @pytest.fixture
-        def trace():
-            return _trace
-
-        # Existing factories need not accept task names.
-        def traced_task_factory(loop, coro, *, context=None):
-            calling_context = contextvars.copy_context()
-            calling_context.run(_trace.set, "instrumented")
-            return calling_context.run(asyncio.Task, coro, loop=loop, context=context)
-
-        def traced_loop_factory():
-            loop = asyncio.new_event_loop()
-            loop.set_task_factory(traced_task_factory)
-            return loop
-
-        def pytest_asyncio_loop_factories(config, item):
-            return {"traced": traced_loop_factory}
-        """))
-    pytester.makepyfile(dedent("""\
-        import pytest
-        import pytest_asyncio
-
-        @pytest_asyncio.fixture
-        async def traced_fixture(trace):
-            assert trace.get() == "instrumented"
-
-        @pytest.fixture
-        def sync_dependent(traced_fixture, trace):
-            assert trace.get() == "instrumented"
-
-        @pytest.mark.asyncio
-        async def test(sync_dependent, trace):
-            assert trace.get() == "instrumented"
-        """))
-    result = pytester.runpytest("--asyncio-mode=strict")
-    result.assert_outcomes(passed=1)
-
-
-@pytest.mark.skipif(
     sys.version_info < (3, 11),
-    reason="The experimental runner requires Python 3.11",
+    reason="loop.create_task() passes task factories a context from Python 3.11",
 )
-def test_sync_dependents_see_context_assigned_by_factory_before_task_creation(
+def test_a_task_factory_assigning_before_it_creates_the_task_does_not_change_fixtures(
     pytester: Pytester,
 ):
-    """The experimental runner propagates the value inherited by the fixture task."""
-    pytester.makeini(
-        "[pytest]\n"
-        "experimental_asyncio_task_group_runner = true\n"
-        "asyncio_default_fixture_loop_scope = function"
-    )
+    """Assigning before creating the task does not reach the fixture or its user."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         import asyncio
         from contextvars import ContextVar
@@ -549,9 +549,9 @@ def test_sync_dependents_see_context_assigned_by_factory_before_task_creation(
             loop = asyncio.get_running_loop()
             original_factory = loop.get_task_factory()
 
-            def task_factory(loop, coro, context=None, **kwargs):
+            def task_factory(loop, coro, **kwargs):
                 value.set("factory")
-                return asyncio.Task(coro, loop=loop, context=context, **kwargs)
+                return asyncio.Task(coro, loop=loop, **kwargs)
 
             loop.set_task_factory(task_factory)
             try:
@@ -562,26 +562,22 @@ def test_sync_dependents_see_context_assigned_by_factory_before_task_creation(
 
         @pytest_asyncio.fixture
         async def resource(configured_task_factory):
-            assert value.get() == "factory"
             return value.get()
 
         def test_sync_consumer(resource):
-            assert resource == "factory"
-            assert value.get() == "factory"
-    """))
+            assert resource == "fixture"
+            assert value.get() == "fixture"
+        """))
     result = pytester.runpytest("--asyncio-mode=strict")
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.parametrize(
-    "fixture_exit", ["return", "yield"], ids=["coroutine", "generator"]
-)
-def test_sync_dependents_keep_fixture_context_when_factory_assigns_after_task_creation(
-    pytester: Pytester, fixture_exit: Literal["return", "yield"]
+def test_a_task_factory_assigning_after_it_creates_the_task_does_not_change_fixtures(
+    pytester: Pytester,
 ):
-    """Factory changes outside the fixture's task do not replace its setup values."""
+    """Assigning after creating the task does not reach the fixture or its users."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
-    pytester.makepyfile(dedent(f"""
+    pytester.makepyfile(dedent("""
         import asyncio
         from contextvars import ContextVar
 
@@ -607,13 +603,93 @@ def test_sync_dependents_keep_fixture_context_when_factory_assigns_after_task_cr
                 loop.set_task_factory(original_factory)
 
         @pytest_asyncio.fixture
-        async def resource(configured_task_factory):
+        async def returned(configured_task_factory):
             assert value.get() == "fixture"
-            {fixture_exit} value.get()
+            return value.get()
 
-        def test_sync_consumer(resource):
-            assert resource == "fixture"
+        @pytest_asyncio.fixture
+        async def yielded(configured_task_factory):
+            assert value.get() == "fixture"
+            yield value.get()
+
+        def test_returned(returned):
+            assert returned == "fixture"
+            assert value.get() == "fixture"
+
+        def test_yielded(yielded):
+            assert yielded == "fixture"
             assert value.get() == "fixture"
         """))
     result = pytester.runpytest("--asyncio-mode=strict")
+    result.assert_outcomes(passed=2)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="loop.create_task() passes task factories a context from Python 3.11",
+)
+@pytest.mark.parametrize(
+    ("task_per_fixture", "seen_by_sync_dependent"),
+    [
+        pytest.param("false", "missing", id="default runner"),
+        pytest.param("true", "set by the task factory", id="experimental runner"),
+    ],
+)
+def test_a_task_factory_assignment_in_the_task_context_reaches_sync_dependents(
+    pytester: Pytester, task_per_fixture: str, seen_by_sync_dependent: str
+):
+    """Only the experimental runner passes a fixture task's context to sync code."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
+    pytester.makeconftest(dedent("""
+        import asyncio
+        import contextvars
+
+        import pytest
+
+        trace = contextvars.ContextVar("trace")
+
+        def traced_task_factory(loop, coro, *, context=None, **kwargs):
+            if context is None:
+                context = contextvars.copy_context()
+            else:
+                context = context.copy()
+            context.run(trace.set, "set by the task factory")
+            return asyncio.Task(coro, loop=loop, context=context, **kwargs)
+
+        def traced_loop_factory():
+            loop = asyncio.new_event_loop()
+            loop.set_task_factory(traced_task_factory)
+            return loop
+
+        def pytest_asyncio_loop_factories(config, item):
+            return {"traced": traced_loop_factory}
+
+        @pytest.fixture
+        def trace_var():
+            return trace
+        """))
+    pytester.makepyfile(dedent("""
+        from pathlib import Path
+
+        import pytest
+        import pytest_asyncio
+
+        @pytest_asyncio.fixture
+        async def traced_fixture(trace_var):
+            assert trace_var.get() == "set by the task factory"
+
+        @pytest.fixture
+        def sync_dependent(traced_fixture, trace_var):
+            Path("seen.txt").write_text(trace_var.get("missing"))
+
+        @pytest.mark.asyncio
+        async def test_uses_sync_dependent(sync_dependent, trace_var):
+            assert trace_var.get() == "set by the task factory"
+        """))
+    result = pytester.runpytest(
+        "--asyncio-mode=strict",
+        "-o",
+        f"asyncio_experimental_task_per_fixture={task_per_fixture}",
+    )
     result.assert_outcomes(passed=1)
+    assert (pytester.path / "seen.txt").read_text() == seen_by_sync_dependent

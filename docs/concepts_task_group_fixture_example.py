@@ -1,8 +1,13 @@
 import asyncio
+import sys
 
 import pytest
 
 import pytest_asyncio
+
+pytestmark = pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="asyncio.TaskGroup requires Python 3.11"
+)
 
 
 async def write_heartbeats(output):

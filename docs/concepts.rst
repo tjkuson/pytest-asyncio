@@ -110,38 +110,58 @@ Context variables
 =================
 
 Context variables hold values, such as a request identifier, that can differ between tasks.
-Pytest-asyncio follows these fixture propagation and test isolation rules:
+pytest-asyncio follows these rules for fixtures and tests:
 
 * Async fixtures and tests inherit context variables from the synchronous pytest code that requests them.
 * Values set during async fixture setup are visible to its synchronous and asynchronous dependents until the fixture is torn down.
 * An async test receives its own context, so its assignments are not visible to later fixtures or tests, even when tests share an event loop.
 
+With the :ref:`asyncio_experimental_task_per_fixture <configuration/asyncio_experimental_task_per_fixture>` option, each example of a Hypothesis test also receives its own context.
+By default, the examples of one test share a context.
+
 The objects held in context variables can still be shared: changing a mutable object can affect other tests.
-See also the experimental runner's :ref:`compatibility notes <configuration/experimental_asyncio_task_group_runner/compatibility>`.
+
+If two fixtures set the same variable and are not torn down in the reverse order of their setup, the variable can lose the value of the fixture that remains, or keep the value of the fixture that was torn down.
+This can happen when a test requests a wider-scoped fixture with ``request.getfixturevalue()`` after a function-scoped one.
+Synchronous fixtures that reset a context variable at teardown behave the same way.
 
 .. _concepts/tasks:
 
 Fixture tasks and cancellation
 ==============================
 
-This section describes the opt-in :ref:`experimental task group runner <configuration/experimental_asyncio_task_group_runner>`.
+This section explains the experimental :ref:`asyncio_experimental_task_per_fixture <configuration/asyncio_experimental_task_per_fixture>` option.
 
-An async generator fixture runs in one asyncio task from setup through teardown.
-This lets a task group or timeout surround its ``yield``: the task that enters the context manager also exits it.
-The default runner uses separate tasks for setup and teardown.
+By default, pytest-asyncio runs the setup of an async generator fixture, the code before ``yield``, in one asyncio task, and its teardown, the code after ``yield``, in another.
+While tests use the fixture, no task runs it, so context managers around ``yield`` do not work as they do in ordinary asyncio code:
 
-A failed test still gets ordinary fixture cleanup.
-A fixture can also receive a request to stop, called *cancellation*, for example when one of its task group's background tasks fails.
-Pytest-asyncio lets fixtures that depend on it finish their cleanup before raising cancellation at the cancelled fixture's ``yield``.
-Enclosing context managers and ``finally`` blocks run; ordinary statements after ``yield`` are skipped unless the fixture handles cancellation.
+* If a background task in an ``asyncio.TaskGroup`` fails, the test is not stopped, and the fixture's teardown can hang while it waits for the group's other tasks.
+* An ``asyncio.timeout()`` that expires does not stop the test, and no error is reported.
+* An AnyIO cancel scope or task group fails at teardown with "Attempted to exit cancel scope in a different task than it was entered in".
 
-For example, this fixture records a heartbeat while the test uses its file:
+With the option enabled, each async fixture runs in an asyncio task of its own, from setup to teardown.
+While tests use the fixture, its task waits at ``yield``, so context managers around ``yield`` are entered and exited in the same task, as in ordinary asyncio code.
+
+For example, this fixture writes a heartbeat to a file while the test uses it:
 
 .. include:: concepts_task_group_fixture_example.py
     :code: python
 
 The ``finally`` block stops the background task, the task group waits for it to finish, and the outer ``with`` closes the file.
-If a background write fails, the running test is cancelled and pytest reports the background error at fixture teardown.
-The context managers and ``finally`` block also handle cleanup in that case.
 
-See :ref:`configuration/experimental_asyncio_task_group_runner/cancellation` for the effects on other tests and the limits of cancellation.
+A task group or timeout stops the code inside it by *cancelling* its task: ``asyncio.CancelledError`` is raised where the task is waiting.
+For a fixture, that is at ``yield``, while the test and other fixtures still use its value.
+Unwinding the fixture at that point would close resources they are using, so pytest-asyncio handles the cancellation in two parts:
+
+* The async test or fixture setup running on the fixture's event loop, if any, is cancelled, as code inside the task group would be.
+  Unless it handles the cancellation, it fails with an error that names the cancelled fixture.
+* The fixture receives the cancellation at ``yield`` when pytest tears it down, after the fixtures that depend on it.
+  Context managers and ``finally`` blocks run, but other statements after ``yield`` are skipped unless the fixture handles the cancellation.
+  The task group's or timeout's error is reported as an error at the fixture's teardown.
+  One combination of AnyIO and asyncio scopes is an exception; see the option's :ref:`limitations <configuration/asyncio_experimental_task_per_fixture/limitations>`.
+
+In the example, if a heartbeat write fails, the test is cancelled.
+When pytest tears down the fixture, the ``finally`` block, the task group and the ``with`` statement clean up, and pytest reports the write error.
+
+Until the cancelled fixture is torn down, new async tests and fixture setups on its event loop fail.
+The :ref:`reference <configuration/asyncio_experimental_task_per_fixture>` describes this and the option's limitations.

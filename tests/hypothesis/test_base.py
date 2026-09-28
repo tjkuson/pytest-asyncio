@@ -98,18 +98,26 @@ def test_sync_not_auto_marked(pytester: Pytester):
     result.assert_outcomes(passed=1)
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
+@pytest.mark.parametrize(
+    ("task_per_fixture", "values_seen"),
+    [
+        pytest.param("false", {"initial", "changed"}, id="default runner"),
+        pytest.param(
+            "true",
+            {"initial"},
+            id="experimental runner",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 11),
+                reason="asyncio_experimental_task_per_fixture requires Python 3.11",
+            ),
+        ),
+    ],
 )
-def test_experimental_runner_isolates_context_variables_between_examples(
-    pytester: Pytester,
+def test_examples_share_context_assignments_only_with_the_default_runner(
+    pytester: Pytester, task_per_fixture: str, values_seen: set[str]
 ):
-    """Each example starts without context assignments made by earlier examples."""
-    pytester.makeini(dedent("""
-        [pytest]
-        asyncio_default_fixture_loop_scope = function
-        experimental_asyncio_task_group_runner = true
-        """))
+    """With the experimental runner, each example starts from the test's context."""
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         from contextvars import ContextVar
 
@@ -124,27 +132,30 @@ def test_experimental_runner_isolates_context_variables_between_examples(
         @example(value=True)
         @given(value=st.booleans())
         async def test_example(value):
-            assert request_id.get() == "initial"
+            with open("seen.txt", "a") as seen:
+                print(request_id.get(), file=seen)
             request_id.set("changed")
         """))
 
-    result = pytester.runpytest("--asyncio-mode=strict")
+    result = pytester.runpytest(
+        "--asyncio-mode=strict",
+        "-o",
+        f"asyncio_experimental_task_per_fixture={task_per_fixture}",
+    )
 
     result.assert_outcomes(passed=1)
+    assert set((pytester.path / "seen.txt").read_text().split()) == values_seen
 
 
 @pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="The experimental runner requires Python 3.11"
+    sys.version_info < (3, 11),
+    reason="loop.create_task() passes task factories a context from Python 3.11",
 )
 def test_examples_keep_fixture_context_when_factory_assigns_after_task_creation(
     pytester: Pytester,
 ):
     """A task factory's assignment does not leak into later Hypothesis examples."""
-    pytester.makeini(dedent("""
-        [pytest]
-        asyncio_default_fixture_loop_scope = function
-        experimental_asyncio_task_group_runner = true
-        """))
+    pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         import asyncio
         from contextvars import ContextVar
