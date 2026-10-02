@@ -226,10 +226,10 @@ def test_isolation_against_context_changes_in_async_tests(
     result.assert_outcomes(passed=2)
 
 
-def test_a_sync_fixture_assignment_is_seen_by_async_tests_however_old_their_loop(
+def test_a_sync_fixture_assignment_is_seen_by_async_tests_on_new_and_reused_loops(
     pytester: Pytester,
 ):
-    """A shared loop created before or after the sync fixture sees its value."""
+    """Async tests see the value on a loop created before or after the fixture ran."""
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""
         from contextvars import ContextVar
@@ -267,7 +267,7 @@ def test_a_sync_fixture_assignment_is_seen_by_async_tests_however_old_their_loop
     result.assert_outcomes(passed=4)
 
 
-def test_a_sync_test_assignment_is_seen_by_later_async_tests_however_old_their_loop(
+def test_a_sync_test_assignment_is_seen_by_later_async_tests_on_a_reused_loop(
     pytester: Pytester,
 ):
     """An async test on a loop created before the assignment still sees it."""

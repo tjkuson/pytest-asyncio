@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from textwrap import dedent
 
+import pluggy
 import pytest
+from packaging.version import Version
 from pytest import Pytester
 
 import pytest_asyncio
@@ -64,13 +66,12 @@ def test_sync_function_uses_async_fixture(pytester: Pytester, mode):
     result.assert_outcomes(passed=1)
 
 
+@pytest.mark.skipif(
+    Version(pluggy.__version__) < Version("1.6"),
+    reason="Older pluggy replaces StopIteration from hook wrappers (pluggy#544)",
+)
 def test_a_sync_fixture_raising_stop_iteration_is_matched_by_xfail(pytester: Pytester):
     """Wrapping a synchronous fixture preserves the exception that xfail expects."""
-    pytest.importorskip(
-        "pluggy",
-        minversion="1.6",
-        reason="Older pluggy replaces StopIteration from hook wrappers (pluggy#544)",
-    )
     pytester.makeini("[pytest]\nasyncio_default_fixture_loop_scope = function")
     pytester.makepyfile(dedent("""\
         import pytest

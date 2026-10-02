@@ -91,7 +91,7 @@ Then:
   A module-scoped fixture on a module-scoped loop affects the rest of that module's tests on the loop.
 
 When an exception interrupts the event loop, such as a timeout from `pytest-timeout <https://github.com/pytest-dev/pytest-timeout>`_ with the ``signal`` method, pytest-asyncio cancels the running async test or fixture and waits for its cleanup while the fixtures it uses are still available.
-By default, only Ctrl-C is handled this way: after other interruptions, the test's cleanup runs only when its event loop closes, after its fixtures have been torn down.
+Without this option, only Ctrl-C is handled this way: after other interruptions, the test's cleanup runs only when its event loop closes, after its fixtures have been torn down.
 
 .. _configuration/asyncio_experimental_task_per_fixture/limitations:
 
@@ -99,3 +99,5 @@ Limitations
 -----------
 
 Cancel only tasks that your code created: cancelling tasks that pytest-asyncio uses, for example every task in ``asyncio.all_tasks()``, can fail a test or fixture, cut its cleanup short, or make code that then waits for those tasks hang.
+
+If a fixture's AnyIO cancel scope is cancelled while the fixture is in use, the fixture uses extra CPU until pytest tears it down, for example while its dependents clean up.

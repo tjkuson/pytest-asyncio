@@ -45,6 +45,8 @@ def test_an_async_fixture_requested_by_a_running_test_is_refused_without_harm(
         "--asyncio-mode=strict", "-W", "error", timeout=30
     )
     result.assert_outcomes(passed=2)
+    # -W error turns an unawaited coroutine into a failed exit, after the summary.
+    assert result.ret == pytest.ExitCode.OK
     assert not (pytester.path / "fixture-started").exists()
 
 

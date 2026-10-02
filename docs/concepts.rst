@@ -121,17 +121,16 @@ While tests use the fixture, no task runs it, so context managers around ``yield
 With the option enabled, each async fixture runs in an asyncio task of its own, from setup to teardown.
 While tests use the fixture, its task waits at ``yield``, so context managers around ``yield`` are entered and exited in the same task, as in ordinary asyncio code.
 
-For example, this fixture gives each test that uses it one second to finish:
+For example, this fixture sets a one-second deadline, counted from its setup, for each async test that uses it:
 
 .. include:: concepts_fixture_deadline_example.py
     :code: python
 
 A task group or timeout stops the code inside it by *cancelling* its task: ``asyncio.CancelledError`` is raised where the task is waiting.
 For a fixture, that is at ``yield``, while the test and other fixtures still use its value.
-Unwinding the fixture at that point would close resources they are using, so pytest-asyncio handles the cancellation in two parts:
+Cleaning up the fixture at that point would close resources they are using, so pytest-asyncio handles the cancellation in two parts:
 
-* The async test or fixture setup running on the fixture's event loop, if any, is cancelled, as code inside the task group would be.
-  Unless it handles the cancellation, it fails with an error that names the cancelled fixture.
+* The async test or fixture setup running on the fixture's event loop, if any, is cancelled, as code inside the task group or timeout would be.
 * The fixture receives the cancellation at ``yield`` when pytest tears it down, after the fixtures that depend on it.
   Context managers and ``finally`` blocks run, but other statements after ``yield`` are skipped unless the fixture handles the cancellation.
   The task group's or timeout's error is reported as an error at the fixture's teardown.

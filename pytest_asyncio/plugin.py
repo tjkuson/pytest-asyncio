@@ -363,10 +363,14 @@ def _fixture_synchronizer(
 
     def get_runner() -> Runner:
         _raise_if_event_loop_running()
-        return _request_loop_fixture(fixturedef, request, runner_fixture_id, Runner)
+        return _request_runner_dependency(
+            fixturedef, request, runner_fixture_id, Runner
+        )
 
     def get_loop() -> AbstractEventLoop:
-        runner = _request_loop_fixture(fixturedef, request, runner_fixture_id, Runner)
+        runner = _request_runner_dependency(
+            fixturedef, request, runner_fixture_id, Runner
+        )
         return runner.get_loop()
 
     if inspect.isasyncgenfunction(fixturedef.func):
@@ -379,14 +383,14 @@ def _fixture_synchronizer(
         return _wrap_sync_fixture(fixture_function, get_loop)  # type: ignore[arg-type]
 
 
-def _request_loop_fixture(
+def _request_runner_dependency(
     fixturedef: FixtureDef[object],
     request: FixtureRequest,
     name: str,
     fixture_type: type[_T],
 ) -> _T:
     """
-    Request a private loop fixture for the fixture being set up.
+    Request a runner fixture as a dependency of the fixture being set up.
 
     Call it from the function pytest calls for the fixture, not from the
     pytest_fixture_setup hook: pytest caches only the former's errors as the
@@ -394,10 +398,10 @@ def _request_loop_fixture(
     """
     value = request.getfixturevalue(name)
     assert isinstance(value, fixture_type)
-    # Pytest orders teardown only for fixtures declared as parameters, not for
-    # those requested with getfixturevalue(), so the loop could close first.
-    loop_fixturedef = request._get_active_fixturedef(name)
-    loop_fixturedef.addfinalizer(
+    # FixtureDef.execute registers a fixture's finish() with the fixtures it
+    # declares as parameters, not with those it requests with getfixturevalue().
+    runner_fixturedef = request._get_active_fixturedef(name)
+    runner_fixturedef.addfinalizer(
         # Pytest passes a SubRequest, which it does not export; FixtureRequest is
         # its public base type.
         functools.partial(fixturedef.finish, request=request)  # type: ignore[arg-type]
@@ -406,9 +410,8 @@ def _request_loop_fixture(
 
 
 def _raise_if_event_loop_running() -> None:
-    # A loop is running if, say, an async test requests an async fixture.
-    # asyncio refuses too, but only after pytest-asyncio has created the work it
-    # would run, which then goes unawaited.
+    # Fail before creating async work that asyncio would refuse to run, so that
+    # nothing is left unawaited.
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -597,7 +600,7 @@ def _task_runner_fixture_synchronizer(
 
     def get_task_runner() -> TaskRunner:
         _raise_if_event_loop_running()
-        return _request_loop_fixture(
+        return _request_runner_dependency(
             fixturedef, request, f"_{loop_scope}_scoped_task_runner", TaskRunner
         )
 
@@ -615,14 +618,14 @@ def _cancelled_fixture_error(
     phase: Literal["setup", "teardown"], name: str, task_runner: TaskRunner
 ) -> PytestAsyncioError:
     """
-    Report a cancelled setup or teardown to pytest as an Exception.
+    Return the error to raise instead of a fixture's CancelledError.
 
-    Pytest caches a setup error, and runs the remaining finalizers after a
-    teardown error, only for Exception subclasses; CancelledError is not one.
+    Pytest does not cache a raw CancelledError as a fixture's setup error, and
+    does not run a node's remaining finalizers after one.
     """
     msg = f"The {phase} of async fixture {name!r} was cancelled."
-    # A setup, never a teardown, is also cancelled when another fixture on its
-    # loop is cancelled while in use: name that fixture.
+    # Cancelling a held fixture also cancels a pending setup, never a teardown;
+    # the refusal reason names the held fixture.
     if phase == "setup" and task_runner.refusal_reason is not None:
         msg += " " + task_runner.refusal_reason
     return PytestAsyncioError(msg)
@@ -1149,6 +1152,8 @@ def _synchronize_task_runner_coroutine(
                 name=func.__name__,
             )
         except asyncio.CancelledError as exc:
+            # Unlike a fixture's, a test's CancelledError needs no translation:
+            # pytest reports it as the test's failure.
             if task_runner.refusal_reason is not None:
                 exc.add_note(task_runner.refusal_reason)
             raise
@@ -1319,9 +1324,8 @@ def _task_runner(asyncio_runner: Runner) -> Iterator[TaskRunner]:
     try:
         task_runner.close()
     except BaseException:
-        # Pytest skips a node's remaining finalizers after an exception that
-        # is not an Exception, such as KeyboardInterrupt, so the loop
-        # fixture's own finalizer might not run.
+        # If closing is interrupted, e.g. by KeyboardInterrupt, pytest skips the
+        # node's remaining finalizers, including the one that closes the loop.
         asyncio_runner.close()
         raise
 
