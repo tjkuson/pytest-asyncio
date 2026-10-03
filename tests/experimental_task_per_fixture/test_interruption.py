@@ -2,7 +2,8 @@
 Ctrl-C and pytest-timeout with asyncio_experimental_task_per_fixture.
 
 The interrupted test or fixture is cancelled, and its cleanup runs while its
-fixtures are still set up. A second Ctrl-C stops waiting for that cleanup.
+fixtures are still set up. A second Ctrl-C stops waiting for that cleanup,
+which is left to the closing of the loop.
 A loop callback raising KeyboardInterrupt stands in for Ctrl-C.
 """
 
@@ -67,6 +68,36 @@ def test_pytest_timeout_lets_the_test_cleanup_use_its_fixtures(pytester: Pyteste
     assert (pytester.path / "report.txt").read_text() == "saved during cleanup"
 
 
+def test_a_test_calling_sys_exit_fails_and_later_tests_use_its_loop(
+    pytester: Pytester,
+):
+    """SystemExit is reported as the test's own failure, and the session continues."""
+    pytester.makeini(
+        "[pytest]\n"
+        "asyncio_experimental_task_per_fixture = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+        import sys
+
+        import pytest
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_exits():
+            sys.exit(3)
+
+        @pytest.mark.asyncio(loop_scope="module")
+        async def test_next():
+            pass
+        """))
+
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+
+    result.assert_outcomes(failed=1, passed=1)
+    result.stdout.fnmatch_lines(["*_ test_exits _*", "*SystemExit: 3"])
+    assert "pytest-asyncio received" not in result.stdout.str()
+
+
 def test_a_cleanup_error_after_ctrl_c_fails_the_test_and_the_session_continues(
     pytester: Pytester,
 ):
@@ -107,6 +138,49 @@ def test_a_cleanup_error_after_ctrl_c_fails_the_test_and_the_session_continues(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Uses pytest-timeout's signals")
+def test_sys_exit_during_cleanup_after_ctrl_c_fails_the_test_and_names_the_ctrl_c(
+    pytester: Pytester,
+):
+    pytester.makeini(
+        "[pytest]\n"
+        "asyncio_experimental_task_per_fixture = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        import sys
+
+        import pytest
+
+        def ctrl_c():
+            raise KeyboardInterrupt
+
+        @pytest.mark.asyncio
+        async def test_exits_during_cleanup():
+            asyncio.get_running_loop().call_soon(ctrl_c)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                sys.exit(3)
+
+        def test_next():
+            pass
+        """))
+
+    result = pytester.runpytest_subprocess(
+        "--asyncio-mode=strict", "-W", "error", timeout=30
+    )
+
+    result.assert_outcomes(failed=1, passed=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*SystemExit: 3",
+            "*Raised during cleanup after pytest-asyncio received: KeyboardInterrupt()",
+        ]
+    )
+    assert "never retrieved" not in result.stdout.str() + result.stderr.str()
+
+
 def test_a_cleanup_error_after_pytest_timeout_is_reported_with_the_timeout(
     pytester: Pytester,
 ):
@@ -291,9 +365,8 @@ def test_a_fixture_that_yields_as_ctrl_c_arrives_is_torn_down_before_its_parent(
     assert (pytester.path / "report.txt").read_text() == "saved during teardown"
 
 
-@pytest.mark.parametrize("error", ["RuntimeError", "SystemExit"])
 def test_an_error_from_test_cleanup_abandoned_by_a_second_ctrl_c_is_logged_once(
-    pytester: Pytester, error: str
+    pytester: Pytester,
 ):
     """
     A second Ctrl-C stops waiting for the test's cleanup, whose error is logged.
@@ -306,7 +379,7 @@ def test_an_error_from_test_cleanup_abandoned_by_a_second_ctrl_c_is_logged_once(
         "asyncio_experimental_task_per_fixture = true\n"
         "asyncio_default_fixture_loop_scope = function"
     )
-    pytester.makepyfile(dedent(f"""\
+    pytester.makepyfile(dedent("""\
         import asyncio
 
         import pytest
@@ -325,7 +398,7 @@ def test_an_error_from_test_cleanup_abandoned_by_a_second_ctrl_c_is_logged_once(
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
-                    raise {error}("abandoned cleanup failed") from None
+                    raise RuntimeError("abandoned cleanup failed") from None
         """))
 
     result = pytester.runpytest_subprocess(
@@ -334,7 +407,7 @@ def test_an_error_from_test_cleanup_abandoned_by_a_second_ctrl_c_is_logged_once(
 
     assert result.ret == pytest.ExitCode.INTERRUPTED
     output = result.stdout.str() + result.stderr.str()
-    assert output.count(f"{error}: abandoned cleanup failed") == 1
+    assert output.count("RuntimeError: abandoned cleanup failed") == 1
     for noise in ("Task was destroyed", "never awaited", "never retrieved"):
         assert noise not in output
 
@@ -448,11 +521,72 @@ def test_an_error_from_fixture_teardown_abandoned_by_a_second_ctrl_c_is_logged_o
         assert noise not in output
 
 
-def test_ctrl_c_while_the_loop_waits_for_abandoned_cleanup_still_closes_it(
+def test_a_second_ctrl_c_just_after_the_cancelled_test_finishes_lets_the_loop_shut_down(
     pytester: Pytester,
 ):
     """
-    A third Ctrl-C, while the loop closes, stops waiting and still closes the loop.
+    The loop still closes its async generators when it shuts down.
+
+    The callback raises twice, each time once no task is left: after the test
+    finishes, and after pytest-asyncio's wait for the cancelled test finishes.
+    Both times asyncio has queued the callback that stops that run of the loop.
+    """
+    pytester.makeini(
+        "[pytest]\n"
+        "asyncio_experimental_task_per_fixture = true\n"
+        "asyncio_default_fixture_loop_scope = function"
+    )
+    pytester.makepyfile(dedent("""\
+        import asyncio
+        from pathlib import Path
+
+        import pytest
+
+        interruptions = 0
+        saw_the_wait_for_the_cancelled_test = False
+
+        def ctrl_c_once_every_task_is_done():
+            global interruptions, saw_the_wait_for_the_cancelled_test
+            loop = asyncio.get_running_loop()
+            if asyncio.all_tasks(loop):
+                saw_the_wait_for_the_cancelled_test = interruptions == 1
+                loop.call_soon(ctrl_c_once_every_task_is_done)
+            elif interruptions == 0:
+                interruptions = 1
+                loop.call_soon(ctrl_c_once_every_task_is_done)
+                raise KeyboardInterrupt
+            elif saw_the_wait_for_the_cancelled_test:
+                raise KeyboardInterrupt
+            else:
+                loop.call_soon(ctrl_c_once_every_task_is_done)
+
+        async def numbers():
+            try:
+                yield 1
+                yield 2
+            finally:
+                Path("generator.txt").write_text("closed")
+
+        unfinished_generators = []
+
+        @pytest.mark.asyncio
+        async def test_finishes():
+            unfinished_generators.append(numbers())
+            await anext(unfinished_generators[0])
+            asyncio.get_running_loop().call_soon(ctrl_c_once_every_task_is_done)
+        """))
+
+    result = pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
+
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert (pytester.path / "generator.txt").read_text() == "closed"
+
+
+def test_a_third_ctrl_c_as_the_loop_is_prepared_for_closing_still_closes_it(
+    pytester: Pytester,
+):
+    """
+    The third Ctrl-C is raised when pytest-asyncio next runs the loop, to close it.
 
     Pytest does not handle a KeyboardInterrupt raised as its session finishes,
     so the process ends as for any uncaught KeyboardInterrupt.
@@ -496,11 +630,8 @@ def test_ctrl_c_while_the_loop_waits_for_abandoned_cleanup_still_closes_it(
                 await asyncio.Event().wait()
             finally:
                 loop.call_soon(ctrl_c)
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    loop.call_soon(ctrl_c)
-                    await asyncio.Event().wait()
+                loop.call_soon(ctrl_c)
+                await asyncio.Event().wait()
         """))
 
     pytester.runpytest_subprocess("--asyncio-mode=strict", timeout=30)
@@ -542,10 +673,7 @@ def test_a_fixture_setup_that_survives_a_second_ctrl_c_is_torn_down_once_it_yiel
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 loop.call_soon(ctrl_c)
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    pass
+                await asyncio.sleep(0)
             resource_yielded.set()
             try:
                 yield
