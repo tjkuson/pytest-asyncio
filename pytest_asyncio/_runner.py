@@ -227,7 +227,7 @@ class TaskRunner:
         """
         __tracebackhide__ = True
         if self._run_cut_short:
-            # Work around a CPython bug: run_until_complete() stops the loop
+            # Work around CPython gh-158406: run_until_complete() stops the loop
             # from a done callback of its future. If an exception escapes the
             # run after that callback is scheduled but before it runs, it stays
             # queued and stops the next run early. One loop iteration runs it,
